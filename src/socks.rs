@@ -57,12 +57,15 @@ impl SocksProxyImpl {
         let mut ip_vec = Vec::<u8>::new();
         let name_vec = Vec::<u8>::new();
         match &self.info.dst {
-            SocketAddr::V4(addr) => {
-                ip_vec.extend(addr.ip().octets().as_ref());
-            }
-            SocketAddr::V6(_) => {
-                return Err("SOCKS4 does not support IPv6".into());
-            }
+            Address::SocketAddress(sock) => match sock {
+                SocketAddr::V4(addr) => {
+                    ip_vec.extend(addr.ip().octets().as_ref());
+                }
+                SocketAddr::V6(_) => {
+                    return Err("SOCKS4 does not support IPv6".into());
+                }
+            },
+            _ => todo!()
         }
         self.server_outbuf.extend(ip_vec);
         if let Some(credentials) = credentials {
@@ -183,7 +186,7 @@ impl SocksProxyImpl {
         let addr = if self.command == protocol::Command::UdpAssociate {
             Address::unspecified()
         } else {
-            self.info.dst.into()
+            self.info.dst.clone()
         };
         protocol::Request::new(self.command, addr).write_to_stream(&mut self.server_outbuf)?;
         self.state = SocksState::ReceiveResponse;
@@ -245,7 +248,7 @@ impl SocksProxyImpl {
 #[async_trait::async_trait]
 impl ProxyHandler for SocksProxyImpl {
     fn get_session_info(&self) -> SessionInfo {
-        self.info
+        self.info.clone()
     }
 
     async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> std::io::Result<()> {

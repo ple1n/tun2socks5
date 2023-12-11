@@ -1,5 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
+use socks5_impl::protocol::Address;
+
 #[allow(dead_code)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug, Default)]
 pub(crate) enum IpProtocol {
@@ -21,10 +23,10 @@ impl std::fmt::Display for IpProtocol {
     }
 }
 
-#[derive(Hash, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
+#[derive(Hash, Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
 pub(crate) struct SessionInfo {
     pub(crate) src: SocketAddr,
-    pub(crate) dst: SocketAddr,
+    pub(crate) dst: Address,
     pub(crate) protocol: IpProtocol,
     id: u64,
 }
@@ -33,14 +35,14 @@ impl Default for SessionInfo {
     fn default() -> Self {
         let src = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
         let dst = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
-        Self::new(src, dst, IpProtocol::Tcp)
+        Self::new(src, dst.into(), IpProtocol::Tcp)
     }
 }
 
 static SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SessionInfo {
-    pub fn new(src: SocketAddr, dst: SocketAddr, protocol: IpProtocol) -> Self {
+    pub fn new(src: SocketAddr, dst: Address, protocol: IpProtocol) -> Self {
         let id = SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self { src, dst, protocol, id }
     }

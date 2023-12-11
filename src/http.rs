@@ -310,7 +310,7 @@ impl HttpConnection {
 #[async_trait::async_trait]
 impl ProxyHandler for HttpConnection {
     fn get_session_info(&self) -> SessionInfo {
-        self.info
+        self.info.clone()
     }
 
     async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> std::io::Result<()> {

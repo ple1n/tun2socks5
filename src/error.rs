@@ -1,3 +1,5 @@
+use id_alloc::IDAllocError;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("std::ffi::NulError {0:?}")]
@@ -42,6 +44,9 @@ pub enum Error {
 
     #[error("std::num::ParseIntError {0:?}")]
     IntParseError(#[from] std::num::ParseIntError),
+
+    #[error("{0}")]
+    IDAlloc(#[from] IDAllocError),
 }
 
 impl From<&str> for Error {

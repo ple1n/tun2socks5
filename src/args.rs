@@ -1,30 +1,37 @@
 use crate::{Error, Result};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::UserKey;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
-#[derive(Debug, Clone, Parser)]
+#[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 #[command(author, version, about = "tun2socks5 application.", long_about = None)]
 pub struct Args {
-    /// Proxy URL in the form proto://[username[:password]@]host:port
-    #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL")]
-    pub proxy: ArgProxy,
-
     /// Name of the tun interface
     #[arg(short, long, value_name = "name", default_value = if cfg!(target_os = "linux") { "tun0" } else { "utun3" })]
     pub tun: String,
-
-    /// IPv6 enabled
-    #[arg(short = '6', long)]
-    pub ipv6_enabled: bool,
-
     #[cfg(target_os = "linux")]
     #[arg(short, long)]
     /// Routing and system setup, which decides whether to setup the routing and system configuration
     pub setup: bool,
+    /// Verbosity level
+    #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
+    pub verbosity: ArgVerbosity,
+    #[command(flatten)]
+    pub inner: IArgs,
+}
+
+#[derive(Debug, Clone, Parser, Serialize, Deserialize)]
+pub struct IArgs {
+    /// Proxy URL in the form proto://[username[:password]@]host:port
+    #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL")]
+    pub proxy: ArgProxy,
+    /// IPv6 enabled
+    #[arg(short = '6', long)]
+    pub ipv6_enabled: bool,
 
     /// DNS handling strategy
-    #[arg(short, long, value_name = "strategy", value_enum, default_value = "direct")]
+    #[arg(short, long, value_name = "strategy", value_enum, default_value = "handled")]
     pub dns: ArgDns,
 
     /// DNS resolver address
@@ -34,13 +41,9 @@ pub struct Args {
     /// IPs used in routing setup which should bypass the tunnel
     #[arg(short, long, value_name = "IP")]
     pub bypass: Vec<IpAddr>,
-
-    /// Verbosity level
-    #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
-    pub verbosity: ArgVerbosity,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]
 pub enum ArgVerbosity {
     Off,
     Error,
@@ -53,14 +56,16 @@ pub enum ArgVerbosity {
 /// DNS query handling strategy
 /// - OverTcp: Use TCP to send DNS queries to the DNS server
 /// - Direct: Do not handle DNS by relying on DNS server bypassing
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]
 pub enum ArgDns {
     OverTcp,
-    #[default]
     Direct,
+    /// There is also a default value in clap
+    #[default]
+    Handled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArgProxy {
     pub proxy_type: ProxyType,
     pub addr: SocketAddr,
@@ -112,7 +117,7 @@ impl ArgProxy {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Deserialize, Serialize)]
 pub enum ProxyType {
     Socks4,
     #[default]

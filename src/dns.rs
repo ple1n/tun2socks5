@@ -5,7 +5,6 @@ use trust_dns_proto::{
     rr::{record_type::RecordType, Name, RData, Record},
 };
 
-#[allow(dead_code)]
 pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u32) -> Result<Message, String> {
     let record = match ip {
         IpAddr::V4(ip) => {
@@ -76,4 +75,48 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
     }
     let message = Message::from_vec(data).map_err(|e| e.to_string())?;
     Ok(message)
+}
+
+use id_alloc::{Ipv4Network, NetRange};
+use crate::error::Result;
+use id_alloc::{IDAlloc, Ipv4A};
+use std::ops::RangeInclusive;
+use std::net::Ipv4Addr;
+
+use bimap::BiMap;
+
+pub struct VirtDNS {
+    pub(crate) map: BiMap<Ipv4Addr, String>,
+    pub(crate) baseaddr: Ipv4Addr,
+    pub(crate) dom: RangeInclusive<Ipv4A>,
+    pub(crate) tree: IDAlloc<Ipv4A>,
+}
+
+impl VirtDNS {
+    pub fn default() -> Result<Self> {
+        let baseaddr = "198.18.0.0".parse()?;
+        Ok(VirtDNS {
+            map: Default::default(),
+            tree: Default::default(),
+            baseaddr,
+            dom: Ipv4Network::new(baseaddr, 16).unwrap().range(0),
+        })
+    }
+    pub fn alloc(&mut self, dom: &str) -> Result<&Ipv4Addr> {
+        if self.map.contains_right(dom) {
+            Ok(self.map.get_by_right(dom).unwrap())
+        } else {
+            let v4 = self.tree.alloc_or(&self.dom)?;
+            self.map.insert(v4.addr.into(), dom.to_owned());
+            Ok(self.map.get_by_right(dom).unwrap())
+        }
+    }
+    pub fn receive_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let message = parse_data_to_dns_message(data, false)?;
+        let qname = extract_domain_from_dns_message(&message)?;
+        log::info!("Allocate VirtDNS Name {}", qname);
+        let ip = self.alloc(&qname)?;
+        let message = build_dns_response(message, &qname, ip.to_owned().into(), 5)?;
+        Ok(message.to_vec()?)
+    }
 }
