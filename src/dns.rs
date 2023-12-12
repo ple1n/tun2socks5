@@ -1,3 +1,4 @@
+use socks5_impl::protocol::Address;
 use std::{net::IpAddr, str::FromStr};
 use trust_dns_proto::op::MessageType;
 use trust_dns_proto::{
@@ -77,11 +78,11 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
     Ok(message)
 }
 
-use id_alloc::{Ipv4Network, NetRange};
 use crate::error::Result;
 use id_alloc::{IDAlloc, Ipv4A};
+use id_alloc::{Ipv4Network, NetRange};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::RangeInclusive;
-use std::net::Ipv4Addr;
 
 use bimap::BiMap;
 
@@ -118,5 +119,17 @@ impl VirtDNS {
         let ip = self.alloc(&qname)?;
         let message = build_dns_response(message, &qname, ip.to_owned().into(), 5)?;
         Ok(message.to_vec()?)
+    }
+    pub fn process(&mut self, addr: SocketAddr) -> Address {
+        match addr {
+            SocketAddr::V4(v4) => {
+                if let Some(ad) = self.map.get_by_left(v4.ip()) {
+                    Address::DomainAddress(ad.to_string(), v4.port())
+                } else {
+                    Address::SocketAddress(v4.into())
+                }
+            }
+            k => k.into(),
+        }
     }
 }
