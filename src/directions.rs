@@ -2,12 +2,14 @@
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub(crate) enum IncomingDirection {
+    /// Ex. socks5 server
     FromServer,
     FromClient,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub(crate) enum OutgoingDirection {
+    /// Ex. socks5 server
     ToServer,
     ToClient,
 }

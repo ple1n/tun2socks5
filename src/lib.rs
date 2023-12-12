@@ -136,7 +136,6 @@ async fn handle_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
 ) -> crate::Result<()> {
     let mut server = TcpStream::connect(server_addr).await?;
-
     let session_info = proxy_handler.lock().await.get_session_info();
     log::info!("Beginning {}", session_info);
 
@@ -145,16 +144,9 @@ async fn handle_tcp_session(
     let (mut t_rx, mut t_tx) = tokio::io::split(tcp_stack);
     let (mut s_rx, mut s_tx) = tokio::io::split(server);
 
-    let result = tokio::join! {
-         tokio::io::copy(&mut t_rx, &mut s_tx),
-         tokio::io::copy(&mut s_rx, &mut t_tx),
-    };
-    let result = match result {
-        (Ok(t), Ok(s)) => Ok((t, s)),
-        (Err(e), _) | (_, Err(e)) => Err(e),
-    };
+    let res = tokio::try_join!(tokio::io::copy(&mut t_rx, &mut s_tx), tokio::io::copy(&mut s_rx, &mut t_tx));
 
-    log::info!("Ending {} with {:?}", session_info, result);
+    log::info!("Ending {} with {:?}", session_info, res);
 
     Ok(())
 }
@@ -307,6 +299,7 @@ async fn handle_dns_over_tcp_session(
     Ok(())
 }
 
+/// Read/write to server until connection has been established
 async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<dyn ProxyHandler>>) -> crate::Result<Option<SocketAddr>> {
     let mut launched = false;
     let mut proxy_handler = proxy_handler.lock().await;

@@ -15,7 +15,7 @@ digest_auth = "0.3"
 dotenvy = "0.15"
 env_logger = "0.10"
 httparse = "1.8"
-ipstack = { git = "https://github.com/ssrlive/ipstack.git" }
+ipstack = { path = "../ipstack" }
 log = "0.4"
 regex = "1.10"
 socks5-impl = { path = "../socks5-impl" }
