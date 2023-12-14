@@ -26,6 +26,7 @@ pub use {
     route_config::{config_restore, config_settings, DEFAULT_GATEWAY, TUN_DNS, TUN_GATEWAY, TUN_IPV4, TUN_NETMASK},
 };
 
+mod lru;
 mod args;
 mod directions;
 mod dns;
@@ -50,7 +51,7 @@ where
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
-    let vdns = dns::VirtDNS::default()?;
+    let vdns = dns::VirtDNS::default(4096)?;
     let mut vdns = Arc::new(RwLock::new(vdns));
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr = match args.proxy.proxy_type {

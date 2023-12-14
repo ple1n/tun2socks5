@@ -1,5 +1,6 @@
-use anyhow::{bail, anyhow};
+use anyhow::{anyhow, bail};
 use socks5_impl::protocol::Address;
+use std::num::NonZeroUsize;
 use std::{net::IpAddr, str::FromStr};
 use trust_dns_proto::op::MessageType;
 use trust_dns_proto::{
@@ -80,43 +81,43 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
 }
 
 use crate::error::Result;
+use crate::lru::BijectiveLRU;
 use id_alloc::{IDAlloc, Ipv4A};
 use id_alloc::{Ipv4Network, NetRange};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::RangeInclusive;
 
-use bimap::BiMap;
-
 pub struct VirtDNS {
-    pub(crate) map: BiMap<Ipv4Addr, String>,
+    /// IP -> Domain when getting TCP packets
+    /// Domain -> IP when getting DNS
+    pub(crate) map: BijectiveLRU<Ipv4Addr, String>,
     pub(crate) baseaddr: Ipv4Addr,
     pub(crate) dom: RangeInclusive<Ipv4A>,
     pub(crate) tree: IDAlloc<Ipv4A>,
 }
 
 impl VirtDNS {
-    pub fn default() -> Result<Self> {
+    pub fn default(cap: usize) -> Result<Self> {
         let baseaddr = "198.18.0.0".parse()?;
         Ok(VirtDNS {
-            map: Default::default(),
+            map: BijectiveLRU::new(NonZeroUsize::try_from(cap)?),
             tree: Default::default(),
             baseaddr,
             dom: Ipv4Network::new(baseaddr, 16).unwrap().range(0),
         })
     }
     pub fn alloc(&mut self, dom: &str) -> Result<&Ipv4Addr> {
-        if self.map.contains_right(dom) {
-            Ok(self.map.get_by_right(dom).unwrap())
+        if self.map.rcontains(dom) {
         } else {
             let v4 = self.tree.alloc_or(&self.dom)?;
-            self.map.insert(v4.addr.into(), dom.to_owned());
-            Ok(self.map.get_by_right(dom).unwrap())
+            self.map.push(v4.addr.into(), dom.to_owned());
         }
+        Ok(self.map.rget(dom).unwrap())
     }
     pub fn receive_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
-        log::info!("Allocate VirtDNS Name {}", qname);
+        log::info!("VirtDNS {}", qname);
         let ip = self.alloc(&qname)?;
         let message = build_dns_response(message, &qname, ip.to_owned().into(), 5)?;
         Ok(message.to_vec()?)
@@ -124,7 +125,7 @@ impl VirtDNS {
     pub fn process(&mut self, addr: SocketAddr) -> Address {
         match addr {
             SocketAddr::V4(v4) => {
-                if let Some(ad) = self.map.get_by_left(v4.ip()) {
+                if let Some(ad) = self.map.lget(v4.ip()) {
                     Address::DomainAddress(ad.to_string(), v4.port())
                 } else {
                     Address::SocketAddress(v4.into())
