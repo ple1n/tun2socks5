@@ -90,10 +90,10 @@ use std::ops::RangeInclusive;
 pub struct VirtDNS {
     /// IP -> Domain when getting TCP packets
     /// Domain -> IP when getting DNS
-    pub(crate) map: BijectiveLRU<Ipv4Addr, String>,
-    pub(crate) baseaddr: Ipv4Addr,
-    pub(crate) dom: RangeInclusive<Ipv4A>,
-    pub(crate) tree: IDAlloc<Ipv4A>,
+    pub map: BijectiveLRU<Ipv4Addr, String>,
+    pub baseaddr: Ipv4Addr,
+    pub dom: RangeInclusive<Ipv4A>,
+    pub tree: IDAlloc<Ipv4A>,
 }
 
 impl VirtDNS {
@@ -110,7 +110,12 @@ impl VirtDNS {
         if self.map.rcontains(dom) {
         } else {
             let v4 = self.tree.alloc_or(&self.dom)?;
-            self.map.push(v4.addr.into(), dom.to_owned());
+            let freed = self.map.push(v4.addr.into(), dom.to_owned());
+            for ip in freed {
+                if let Some((ip, domain)) = ip {
+                    self.tree.unset(ip.into())
+                }
+            }
         }
         Ok(self.map.rget(dom).unwrap())
     }
@@ -122,16 +127,27 @@ impl VirtDNS {
         let message = build_dns_response(message, &qname, ip.to_owned().into(), 5)?;
         Ok(message.to_vec()?)
     }
-    pub fn process(&mut self, addr: SocketAddr) -> Address {
+    pub fn process(&mut self, addr: SocketAddr) -> VDNSRES {
         match addr {
             SocketAddr::V4(v4) => {
-                if let Some(ad) = self.map.lget(v4.ip()) {
-                    Address::DomainAddress(ad.to_string(), v4.port())
+                if self.dom.contains(&v4.ip().to_owned().into()) {
+                    // Exclusive range for Virt DNS
+                    if let Some(ad) = self.map.lget(v4.ip()) {
+                        VDNSRES::Addr(Address::DomainAddress(ad.to_string(), v4.port()))
+                    } else {
+                        VDNSRES::ERR
+                    }
+                    // Reset
                 } else {
-                    Address::SocketAddress(v4.into())
+                    VDNSRES::Addr(Address::SocketAddress(v4.into()))
                 }
             }
-            k => k.into(),
+            k => VDNSRES::Addr(k.into()),
         }
     }
+}
+
+pub enum VDNSRES {
+    Addr(Address),
+    ERR,
 }
