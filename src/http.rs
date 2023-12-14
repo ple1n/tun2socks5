@@ -4,6 +4,7 @@ use crate::{
     proxy_handler::{ConnectionManager, ProxyHandler},
     session_info::{IpProtocol, SessionInfo},
 };
+use anyhow::bail;
 use base64::Engine;
 use httparse::Response;
 use socks5_impl::protocol::UserKey;
@@ -79,7 +80,7 @@ impl HttpConnection {
         Ok(res)
     }
 
-    async fn send_tunnel_request(&mut self) -> Result<(), Error> {
+    async fn send_tunnel_request(&mut self) -> Result<()> {
         self.server_outbuf.extend(b"CONNECT ");
         self.server_outbuf.extend(self.info.dst.to_string().as_bytes());
         self.server_outbuf.extend(b" HTTP/1.1\r\nHost: ");
@@ -185,27 +186,27 @@ impl HttpConnection {
                         status_code,
                         res.reason.unwrap()
                     );
-                    return Err(e.into());
+                    bail!(e)
                 }
 
                 let headers_map: HashMap<UniCase<&str>, &[u8], RandomState> =
                     HashMap::from_iter(headers.map(|x| (UniCase::new(x.name), x.value)));
 
                 let Some(auth_data) = headers_map.get(&UniCase::new(PROXY_AUTHENTICATE)) else {
-                    return Err("Proxy requires auth but doesn't send it datails".into());
+                    bail!("Proxy requires auth but doesn't send it datails")
                 };
 
                 if !auth_data[..6].eq_ignore_ascii_case(b"digest") {
                     // Fail to auth and the scheme isn't in the
                     // supported auth method schemes
-                    return Err("Bad credentials".into());
+                    bail!("Bad credentials")
                 }
 
                 // Analize challenge params
                 let data = str::from_utf8(auth_data)?;
                 let state = digest_auth::parse(data)?;
                 if self.before && !state.stale {
-                    return Err("Bad credentials".into());
+                    bail!("Bad credentials")
                 }
 
                 // Update the digest state
@@ -249,7 +250,7 @@ impl HttpConnection {
                                 let f = it.next().unwrap()?;
                                 for k in it {
                                     if k? != f {
-                                        return Err("Malformed response".into());
+                                        bail!("Malformed response")
                                     }
                                 }
                                 f
@@ -313,7 +314,7 @@ impl ProxyHandler for HttpConnection {
         self.info.clone()
     }
 
-    async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> std::io::Result<()> {
+    async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> Result<()> {
         let direction = event.direction;
         let buffer = event.buffer;
         match direction {
@@ -378,9 +379,9 @@ pub(crate) struct HttpManager {
 
 #[async_trait::async_trait]
 impl ConnectionManager for HttpManager {
-    async fn new_proxy_handler(&self, info: SessionInfo, _udp_associate: bool) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
+    async fn new_proxy_handler(&self, info: SessionInfo, _udp_associate: bool) -> Result<Arc<Mutex<dyn ProxyHandler>>> {
         if info.protocol != IpProtocol::Tcp {
-            return Err(Error::from("Invalid protocol").into());
+            bail!(Error::from("Invalid protocol"))
         }
         Ok(Arc::new(Mutex::new(
             HttpConnection::new(info, self.credentials.clone(), self.digest_state.clone()).await?,

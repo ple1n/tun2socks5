@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 pub(crate) trait ProxyHandler: Send + Sync {
     fn get_session_info(&self) -> SessionInfo;
     /// When we have received data from socks5 server, push it into the hub.
-    async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> std::io::Result<()>;
+    async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> crate::Result<()>;
     /// Remove data when it has been sent
     fn consume_data(&mut self, dir: OutgoingDirection, size: usize);
     /// Peek at what is being sent to socks5 server.
@@ -22,6 +22,6 @@ pub(crate) trait ProxyHandler: Send + Sync {
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionManager: Send + Sync {
-    async fn new_proxy_handler(&self, info: SessionInfo, udp_associate: bool) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>>;
+    async fn new_proxy_handler(&self, info: SessionInfo, udp_associate: bool) -> crate::Result<Arc<Mutex<dyn ProxyHandler>>>;
     fn get_server_addr(&self) -> SocketAddr;
 }

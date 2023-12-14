@@ -1,5 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
+use anyhow::bail;
+use crate::Result;
+
 pub const TUN_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 33));
 pub const TUN_NETMASK: IpAddr = IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0));
 pub const TUN_GATEWAY: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -8,7 +11,7 @@ pub const TUN_DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
 pub static mut DEFAULT_GATEWAY: Option<IpAddr> = None;
 
 #[cfg(windows)]
-pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, dns_addr: Option<IpAddr>) -> std::io::Result<()> {
+pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, dns_addr: Option<IpAddr>) -> Result<()> {
     // 1. Setup the adapter's DNS
     // command: `netsh interface ip set dns "utun3" static 8.8.8.8`
     let dns_addr = dns_addr.unwrap_or(TUN_DNS);
@@ -42,7 +45,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, dns_addr: Option<I
 }
 
 #[cfg(target_os = "linux")]
-pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<IpAddr>) -> std::io::Result<()> {
+pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<IpAddr>) -> Result<()> {
     // sudo ip tuntap add name tun0 mode tun
     let args = &["tuntap", "add", "name", tun_name, "mode", "tun"];
     run_command("ip", args)?;
@@ -89,7 +92,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<
 }
 
 #[cfg(target_os = "macos")]
-pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<IpAddr>) -> std::io::Result<()> {
+pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<IpAddr>) -> Result<()> {
     // 0. Save the old gateway
     let old_gateway = get_default_gateway()?;
     unsafe {
@@ -134,7 +137,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<
 }
 
 #[cfg(windows)]
-pub fn config_restore(_bypass_ips: &[IpAddr], _tun_name: &str) -> std::io::Result<()> {
+pub fn config_restore(_bypass_ips: &[IpAddr], _tun_name: &str) -> Result<()> {
     if unsafe { DEFAULT_GATEWAY.is_none() } {
         return Ok(());
     }
@@ -157,7 +160,7 @@ pub fn config_restore(_bypass_ips: &[IpAddr], _tun_name: &str) -> std::io::Resul
 }
 
 #[cfg(target_os = "linux")]
-pub fn config_restore(bypass_ips: &[IpAddr], tun_name: &str) -> std::io::Result<()> {
+pub fn config_restore(bypass_ips: &[IpAddr], tun_name: &str) -> Result<()> {
     // sudo route del bypass_ip
     for bypass_ip in bypass_ips {
         let args = &["del", &bypass_ip.to_string()];
@@ -176,7 +179,7 @@ pub fn config_restore(bypass_ips: &[IpAddr], tun_name: &str) -> std::io::Result<
 }
 
 #[cfg(target_os = "macos")]
-pub fn config_restore(_bypass_ips: &[IpAddr], _tun_name: &str) -> std::io::Result<()> {
+pub fn config_restore(_bypass_ips: &[IpAddr], _tun_name: &str) -> Result<()> {
     if unsafe { DEFAULT_GATEWAY.is_none() } {
         return Ok(());
     }
@@ -204,18 +207,18 @@ pub fn config_restore(_bypass_ips: &[IpAddr], _tun_name: &str) -> std::io::Resul
     Ok(())
 }
 
-pub fn run_command(command: &str, args: &[&str]) -> std::io::Result<Vec<u8>> {
+pub fn run_command(command: &str, args: &[&str]) -> crate::Result<Vec<u8>> {
     let out = std::process::Command::new(command).args(args).output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr });
         let info = format!("{} failed with: \"{}\"", command, err);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, info));
+        bail!(std::io::Error::new(std::io::ErrorKind::Other, info))
     }
     Ok(out.stdout)
 }
 
 #[cfg(windows)]
-pub(crate) fn get_default_gateway() -> std::io::Result<IpAddr> {
+pub(crate) fn get_default_gateway() -> Result<IpAddr> {
     let args = &[
         "-Command",
         "Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter IPEnabled=TRUE | ForEach-Object { $_.DefaultIPGateway }",
@@ -248,7 +251,7 @@ pub(crate) fn get_default_gateway() -> std::io::Result<IpAddr> {
 
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
-pub(crate) fn get_default_gateway() -> std::io::Result<IpAddr> {
+pub(crate) fn get_default_gateway() -> Result<IpAddr> {
     // Command: sh -c "ip route | grep default | awk '{print $3}'"
     let args = &["-c", "ip route | grep default | awk '{print $3}'"];
     let out = run_command("sh", args)?;
@@ -258,7 +261,7 @@ pub(crate) fn get_default_gateway() -> std::io::Result<IpAddr> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn get_default_gateway() -> std::io::Result<IpAddr> {
+pub(crate) fn get_default_gateway() -> Result<IpAddr> {
     // Command: `netstat -rn | grep default | grep -E -o '[0-9\.]+' | head -n 1`
     let args = &["-c", "netstat -rn | grep default | grep -E -o '[0-9\\.]+' | head -n 1"];
     let out = run_command("sh", args)?;

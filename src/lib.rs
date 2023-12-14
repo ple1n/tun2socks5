@@ -3,15 +3,16 @@ use crate::{
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
+use anyhow::{anyhow, bail};
 use id_alloc::NetRange;
-use ipstack::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
+use ipstack::{stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream}, IpStackConfig};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
 use std::{
     collections::{HashMap, VecDeque},
     net::{SocketAddr, SocketAddrV4},
     ops::RangeInclusive,
-    sync::Arc,
+    sync::Arc, time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -57,8 +58,14 @@ where
         ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)) as Arc<dyn ConnectionManager>,
         ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)) as Arc<dyn ConnectionManager>,
     };
+    let conf = IpStackConfig {
+        mtu,
+        packet_info,
+        tcp_timeout: Duration::from_secs(3600),
+        ..Default::default()
+    };
 
-    let mut ip_stack = ipstack::IpStack::new(device, mtu, packet_info);
+    let mut ip_stack = ipstack::IpStack::new(conf, device);
     loop {
         let ip_stack_stream = tokio::select! {
             k = ip_stack.accept() => k,
@@ -163,7 +170,7 @@ async fn handle_udp_associate_session(
     log::info!("Beginning {}", session_info);
 
     let udp_addr = handle_proxy_session(&mut server, proxy_handler).await?;
-    let udp_addr = udp_addr.ok_or("udp associate failed")?;
+    let udp_addr = udp_addr.ok_or(anyhow!("udp associate failed"))?;
 
     let mut udp_server = UdpStream::connect(udp_addr).await?;
 
@@ -314,7 +321,7 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
             let data = proxy_handler.peek_data(dir).buffer;
             let len = data.len();
             if len == 0 {
-                return Err("proxy_handler launched went wrong".into());
+                bail!("proxy_handler launched went wrong")
             }
             server.write_all(data).await?;
             proxy_handler.consume_data(dir, len);
@@ -325,7 +332,7 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
         let mut buf = [0_u8; 4096];
         let len = server.read(&mut buf).await?;
         if len == 0 {
-            return Err("server closed accidentially".into());
+            bail!("server closed accidentially")
         }
         let event = IncomingDataEvent {
             direction: IncomingDirection::FromServer,
