@@ -29,3 +29,4 @@ id_alloc = { path = "../id_alloc" }
 serde = { version = "1.0.193", features = ["derive"] }
 anyhow = "1.0.75"
 lru = "0.12.1"
+bincode = "1.3.3"

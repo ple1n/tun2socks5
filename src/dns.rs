@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail};
+use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::Address;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::{net::IpAddr, str::FromStr};
 use trust_dns_proto::op::MessageType;
@@ -91,29 +94,53 @@ pub struct VirtDNS {
     /// IP -> Domain when getting TCP packets
     /// Domain -> IP when getting DNS
     pub map: BijectiveLRU<Ipv4Addr, String>,
-    pub baseaddr: Ipv4Addr,
-    pub dom: RangeInclusive<Ipv4A>,
-    pub tree: IDAlloc<Ipv4A>,
+    pub subnet: Ipv4Network,
+    pub range: RangeInclusive<Ipv4A>,
+    pub alloc: IDAlloc<Ipv4A>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DNSState<R: Hash + Eq, L: Hash + Eq> {
+    pub map: HashMap<R, L>,
+    pub subnet: Ipv4Network,
+    pub alloc: IDAlloc<Ipv4A>,
 }
 
 impl VirtDNS {
     pub fn default(cap: usize) -> Result<Self> {
-        let baseaddr = "198.18.0.0".parse()?;
+        let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
         Ok(VirtDNS {
             map: BijectiveLRU::new(NonZeroUsize::try_from(cap)?),
-            tree: Default::default(),
-            baseaddr,
-            dom: Ipv4Network::new(baseaddr, 16).unwrap().range(0),
+            range: subnet.range(0),
+            alloc: Default::default(),
+            subnet,
         })
+    }
+    pub fn from_state(cap: usize, sta: DNSState<String, Ipv4Addr>) -> Result<Self> {
+        log::info!("Resume DNS state. {} records", sta.map.len());
+        let map = BijectiveLRU::from_map(NonZeroUsize::try_from(cap)?, sta.map);
+        Ok(Self {
+            map,
+            range: sta.subnet.range(0),
+            subnet: sta.subnet,
+            alloc: sta.alloc,
+        })
+    }
+    pub fn to_state(self) -> DNSState<String, Ipv4Addr> {
+        DNSState {
+            map: self.map.map,
+            subnet: self.subnet,
+            alloc: self.alloc,
+        }
     }
     pub fn alloc(&mut self, dom: &str) -> Result<&Ipv4Addr> {
         if self.map.rcontains(dom) {
         } else {
-            let v4 = self.tree.alloc_or(&self.dom)?;
+            let v4 = self.alloc.alloc_or(&self.range)?;
             let freed = self.map.push(v4.addr.into(), dom.to_owned());
             for ip in freed {
                 if let Some((ip, domain)) = ip {
-                    self.tree.unset(ip.into())
+                    self.alloc.unset(ip.into())
                 }
             }
         }
@@ -130,7 +157,7 @@ impl VirtDNS {
     pub fn process(&mut self, addr: SocketAddr) -> VDNSRES {
         match addr {
             SocketAddr::V4(v4) => {
-                if self.dom.contains(&v4.ip().to_owned().into()) {
+                if self.range.contains(&v4.ip().to_owned().into()) {
                     // Exclusive range for Virt DNS
                     if let Some(ad) = self.map.lget(v4.ip()) {
                         VDNSRES::Addr(Address::DomainAddress(ad.to_string(), v4.port()))

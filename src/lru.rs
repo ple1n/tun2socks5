@@ -1,6 +1,7 @@
 //! LRU with an associated map that maps in reverse
 
 use lru::LruCache;
+use serde::{Serialize, Deserialize};
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -8,9 +9,9 @@ use std::num::NonZeroUsize;
 use std::option::Option;
 
 #[derive(Debug)]
-pub struct BijectiveLRU<L: Hash + Eq, R> {
-    ca: LruCache<L, R>,
-    map: HashMap<R, L>,
+pub struct BijectiveLRU<L: Hash + Eq, R: Eq + Hash> {
+    pub ca: LruCache<L, R>,
+    pub map: HashMap<R, L>,
 }
 
 impl<L: Hash + Eq + Clone, R: Hash + Eq + Clone> BijectiveLRU<L, R> {
@@ -19,6 +20,13 @@ impl<L: Hash + Eq + Clone, R: Hash + Eq + Clone> BijectiveLRU<L, R> {
             ca: LruCache::new(cap),
             map: Default::default(),
         }
+    }
+    pub fn from_map(cap: NonZeroUsize, map: HashMap<R, L>) -> Self {
+        let mut ca = LruCache::new(cap);
+        for (r, l ) in map.iter() {
+            ca.push(l.clone(), r.clone());
+        }
+        Self { ca, map }
     }
     pub fn lget<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> Option<&R>
     where

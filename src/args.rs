@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::UserKey;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::{net::{IpAddr, SocketAddr, ToSocketAddrs}, path::PathBuf};
 
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 #[command(author, version, about = "tun2socks5 application.", long_about = None)]
@@ -41,6 +41,8 @@ pub struct IArgs {
     /// IPs used in routing setup which should bypass the tunnel
     #[arg(short, long, value_name = "IP")]
     pub bypass: Vec<IpAddr>,
+
+    pub state: Option<PathBuf>
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]
