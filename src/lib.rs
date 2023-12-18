@@ -28,7 +28,7 @@ use tokio::{
     net::TcpStream,
     signal::unix::SignalKind,
     sync::{
-        oneshot::{Receiver, Sender},
+        mpsc::{Receiver, Sender},
         Mutex, RwLock,
     },
 };
@@ -99,7 +99,7 @@ where
     tokio::spawn(async move {
         tokio::signal::unix::signal(SignalKind::terminate())?.recv().await;
         log::warn!("SIGTERM received. Dump state");
-        quit_sx.send(()).map_err(|_| anyhow!("send fail"))?;
+        quit_sx.send(()).await.map_err(|_| anyhow!("send fail"))?;
         Result::<_>::Ok(())
     });
 
@@ -107,7 +107,7 @@ where
     loop {
         let ip_stack_stream = tokio::select! {
             k = ip_stack.accept() => k,
-            _ = &mut quit => break,
+            _ = quit.recv() => break,
         }?;
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {

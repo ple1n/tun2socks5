@@ -19,6 +19,9 @@ pub struct Args {
     pub verbosity: ArgVerbosity,
     #[command(flatten)]
     pub inner: IArgs,
+    /// Path to config file
+    #[arg(short, long)]
+    pub path: Option<PathBuf>
 }
 
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
