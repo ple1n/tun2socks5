@@ -1,8 +1,11 @@
 use crate::{Error, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::UserKey;
-use std::{net::{IpAddr, SocketAddr, ToSocketAddrs}, path::PathBuf};
+use std::{
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    path::PathBuf,
+};
 
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 #[command(author, version, about = "tun2socks5 application.", long_about = None)]
@@ -17,11 +20,18 @@ pub struct Args {
     /// Verbosity level
     #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
     pub verbosity: ArgVerbosity,
-    #[command(flatten)]
-    pub inner: IArgs,
-    /// Path to config file
-    #[arg(short, long)]
-    pub path: Option<PathBuf>
+    #[command(subcommand)]
+    pub args: ArgMode,
+}
+
+#[derive(Subcommand, Serialize, Deserialize, Clone, Debug)]
+pub enum ArgMode {
+    /// Specify config by a file
+    File {
+        path: PathBuf
+    },
+    /// Specify config by cmd args
+    Args(#[command(flatten)] IArgs),
 }
 
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
@@ -45,7 +55,7 @@ pub struct IArgs {
     #[arg(short, long, value_name = "IP")]
     pub bypass: Vec<IpAddr>,
 
-    pub state: Option<PathBuf>
+    pub state: Option<PathBuf>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]

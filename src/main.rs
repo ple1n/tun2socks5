@@ -1,5 +1,5 @@
 use clap::Parser;
-use tun2socks5::{config_restore, config_settings, main_entry, Args, TUN_GATEWAY, TUN_IPV4, TUN_NETMASK};
+use tun2socks5::{config_restore, config_settings, main_entry, ArgMode, Args, IArgs, TUN_GATEWAY, TUN_IPV4, TUN_NETMASK};
 
 // const MTU: u16 = 1500;
 const MTU: u16 = u16::MAX;
@@ -8,17 +8,20 @@ const MTU: u16 = u16::MAX;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let mut args = Args::parse();
-
-    if let Some(ref conf) = args.path {
-        log::info!("Reading from {:?}", &conf);
-        let mut f = std::fs::File::open(conf)?;
-        args.inner = serde_json::from_reader(&mut f)?;
-        // Be aware of conflicts            
-        log::info!("State file is {:?}", args.inner.state);
-    }
+    let iargs: IArgs = match args.args {
+        ArgMode::File { path } => {
+            log::info!("Reading from {:?}", &path);
+            let mut f = std::fs::File::open(path)?;
+            let iargs: IArgs = serde_json::from_reader(&mut f)?;
+            // Be aware of conflicts
+            log::info!("State file is {:?}", iargs.state);
+            iargs
+        }
+        ArgMode::Args(args) => args,
+    };
 
     let tun_name = args.tun.clone();
-    let bypass_ips = args.inner.bypass.clone();
+    let bypass_ips = iargs.bypass.clone();
 
     let default = format!("{}={:?}", module_path!(), args.verbosity);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
@@ -45,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         setup = args.setup;
         if setup {
-            config_settings(&bypass_ips, &tun_name, Some(args.inner.dns_addr))?;
+            config_settings(&bypass_ips, &tun_name, Some(iargs.dns_addr))?;
         }
     }
 
@@ -63,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
 
-    if let Err(err) = main_entry(device, MTU, true, args.inner, rx, tx).await {
+    if let Err(err) = main_entry(device, MTU, true, iargs, rx, tx).await {
         log::trace!("main_entry error {}", err);
     }
 
