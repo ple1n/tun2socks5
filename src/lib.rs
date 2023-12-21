@@ -7,6 +7,7 @@ use crate::{
     session_info::{IpProtocol, SessionInfo},
 };
 use anyhow::{anyhow, bail};
+use bytes::BytesMut;
 use id_alloc::NetRange;
 use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
@@ -24,7 +25,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     signal::unix::SignalKind,
     sync::{
@@ -92,6 +93,7 @@ where
         mtu,
         packet_info,
         tcp_timeout: Duration::from_secs(3600),
+        udp_timeout: Duration::from_secs(3600),
         ..Default::default()
     };
 
@@ -120,7 +122,7 @@ where
                         let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
-                                log::error!("{} error \"{}\"", info, err);
+                                log::error!("{} error \"{:?}\"", info, err);
                             }
                             log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                         });
@@ -148,7 +150,7 @@ where
                                     let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                                     tokio::spawn(async move {
                                         if let Err(err) = handle_dns_over_tcp_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
-                                            log::error!("{} error \"{}\"", info, err);
+                                            log::error!("{} error \"{:?}\"", info, err);
                                         }
                                         log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                                     });
@@ -157,7 +159,7 @@ where
                                 ArgDns::Handled => {
                                     let vdns = vdns.clone();
                                     tokio::spawn(async move {
-                                        let mut pack = Vec::with_capacity(1024);
+                                        let mut pack = BytesMut::with_capacity(128);
                                         while udp.read_buf(&mut pack).await? > 0 {
                                             let k = {
                                                 let mut vdns = vdns.write().await;
@@ -180,7 +182,8 @@ where
                         let proxy_handler = mgr.new_proxy_handler(info.clone(), true).await?;
                         tokio::spawn(async move {
                             if let Err(err) = handle_udp_associate_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
-                                log::error!("{} error \"{}\"", info, err);
+                                log::error!("{} error \"{:?}\"", info, err);
+                                println!("{}", err);
                             }
                             log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                         });
@@ -215,7 +218,16 @@ async fn handle_tcp_session(
     let (mut t_rx, mut t_tx) = tokio::io::split(tcp_stack);
     let (mut s_rx, mut s_tx) = tokio::io::split(server);
 
-    let res = tokio::try_join!(tokio::io::copy(&mut t_rx, &mut s_tx), tokio::io::copy(&mut s_rx, &mut t_tx));
+    let res = tokio::try_join!(
+        async {
+            let k = tokio::io::copy(&mut t_rx, &mut s_tx).await?;
+            anyhow::Ok(k)
+        },
+        async {
+            let k = tokio::io::copy(&mut s_rx, &mut t_tx).await?;
+            anyhow::Ok(k)
+        }
+    );
 
     log::info!("Ending {} with {:?}", session_info, res);
 
