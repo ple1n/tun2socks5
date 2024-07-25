@@ -34,7 +34,7 @@ pub enum ArgMode {
     Args(#[command(flatten)] IArgs),
 }
 
-#[derive(Debug, Clone, Parser, Serialize, Deserialize)]
+#[derive(Debug, Clone, Parser, Serialize, Deserialize)]         
 pub struct IArgs {
     /// Proxy URL in the form proto://[username[:password]@]host:port
     #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL")]

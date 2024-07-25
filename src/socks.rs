@@ -20,6 +20,7 @@ enum SocksState {
     Established,
 }
 
+#[derive(Debug)]
 struct SocksProxyImpl {
     info: SessionInfo,
     state: SocksState,
@@ -207,7 +208,7 @@ impl SocksProxyImpl {
         let response = response?;
         self.server_inbuf.drain(0..response.len());
         if response.reply != protocol::Reply::Succeeded {
-            bail!(format!("SOCKS connection failed: {}", response.reply))
+            bail!(format!("SOCKS protocol: {}", response.reply))
         }
         if self.command == protocol::Command::UdpAssociate {
             self.udp_associate = Some(SocketAddr::try_from(&response.address)?);

@@ -38,6 +38,7 @@ enum HttpState {
 
 pub(crate) type DigestState = digest_auth::WwwAuthenticateHeader;
 
+#[derive(Debug)]
 pub struct HttpConnection {
     state: HttpState,
     client_inbuf: VecDeque<u8>,

@@ -2,11 +2,11 @@ use crate::{
     directions::{IncomingDataEvent, OutgoingDataEvent, OutgoingDirection},
     session_info::SessionInfo,
 };
-use std::{net::SocketAddr, sync::Arc};
+use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 
 #[async_trait::async_trait]
-pub(crate) trait ProxyHandler: Send + Sync {
+pub(crate) trait ProxyHandler: Send + Sync + Debug {
     fn get_session_info(&self) -> SessionInfo;
     /// When we have received data from socks5 server, push it into the hub.
     async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> crate::Result<()>;

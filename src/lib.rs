@@ -17,12 +17,7 @@ use log::warn;
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
 use std::{
-    collections::{HashMap, VecDeque},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    ops::{DerefMut, RangeInclusive},
-    process::exit,
-    sync::Arc,
-    time::Duration,
+    collections::{HashMap, VecDeque}, fmt::Debug, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, ops::{DerefMut, RangeInclusive}, process::exit, sync::Arc, time::Duration
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -92,8 +87,8 @@ where
     let conf = IpStackConfig {
         mtu,
         packet_info,
-        tcp_timeout: Duration::from_secs(3600),
-        udp_timeout: Duration::from_secs(3600),
+        tcp_timeout: Duration::from_secs(30),
+        udp_timeout: Duration::from_secs(30),
         ..Default::default()
     };
 
@@ -122,7 +117,9 @@ where
                         let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
-                                log::error!("{} error \"{:?}\"", info, err);
+                                // This kind of error causes mid-connection drop. 
+                                // An error in TCP is handled by state transition internally.
+                                log::error!("Error that causes drop. {} {:?}", info, err);
                             }
                             log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                         });
@@ -408,7 +405,8 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
         let mut buf = [0_u8; 4096];
         let len = server.read(&mut buf).await?;
         if len == 0 {
-            bail!("server closed accidentially")
+            log::error!("{:?}", proxy_handler);
+            bail!("proxy server closed unexpectedly")
         }
         let event = IncomingDataEvent {
             direction: IncomingDirection::FromServer,
