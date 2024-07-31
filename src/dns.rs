@@ -166,16 +166,21 @@ impl VirtDNS {
     pub fn process(&mut self, addr: SocketAddr) -> VDNSRES {
         match addr {
             SocketAddr::V4(v4) => {
-                if self.range.contains(&v4.ip().to_owned().into()) {
-                    // Exclusive range for Virt DNS
-                    if let Some(ad) = self.map.lget(v4.ip()) {
-                        VDNSRES::Addr(Address::DomainAddress(ad.to_string(), v4.port()))
-                    } else {
-                        VDNSRES::ERR
-                    }
-                    // Reset
+                // this takes priority
+                if let Some(desig) = self.designated.get_by_left(&v4.ip()) {
+                    VDNSRES::Addr(Address::DomainAddress(desig.to_owned(), v4.port()))
                 } else {
-                    VDNSRES::Addr(Address::SocketAddress(v4.into()))
+                    if self.range.contains(&v4.ip().to_owned().into()) {
+                        // Exclusive range for Virt DNS
+                        if let Some(ad) = self.map.lget(v4.ip()) {
+                            VDNSRES::Addr(Address::DomainAddress(ad.to_string(), v4.port()))
+                        } else {
+                            VDNSRES::ERR
+                        }
+                        // Reset
+                    } else {
+                        VDNSRES::Addr(Address::SocketAddress(v4.into()))
+                    }
                 }
             }
             k => VDNSRES::Addr(k.into()),
