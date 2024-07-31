@@ -85,6 +85,7 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
 
 use crate::error::Result;
 use crate::lru::BijectiveLRU;
+use bimap::BiMap;
 use id_alloc::{IDAlloc, Ipv4A};
 use id_alloc::{Ipv4Network, NetRange};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -94,6 +95,8 @@ pub struct VirtDNS {
     /// IP -> Domain when getting TCP packets
     /// Domain -> IP when getting DNS
     pub map: BijectiveLRU<Ipv4Addr, String>,
+    /// User designated name mappings
+    pub designated: BiMap<Ipv4Addr, String>,
     pub subnet: Ipv4Network,
     pub range: RangeInclusive<Ipv4A>,
     pub alloc: IDAlloc<Ipv4A>,
@@ -111,6 +114,7 @@ impl VirtDNS {
         let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
         Ok(VirtDNS {
             map: BijectiveLRU::new(NonZeroUsize::try_from(cap)?),
+            designated: Default::default(),
             range: subnet.range(0),
             alloc: Default::default(),
             subnet,
@@ -121,6 +125,7 @@ impl VirtDNS {
         let map = BijectiveLRU::from_map(NonZeroUsize::try_from(cap)?, sta.map);
         Ok(Self {
             map,
+            designated: Default::default(),
             range: sta.subnet.range(0),
             subnet: sta.subnet,
             alloc: sta.alloc,
@@ -136,8 +141,12 @@ impl VirtDNS {
     pub fn alloc(&mut self, dom: &str) -> Result<&Ipv4Addr> {
         if self.map.rcontains(dom) {
         } else {
-            let v4 = self.alloc.alloc_or(&self.range)?;
-            let freed = self.map.push(v4.addr.into(), dom.to_owned());
+            let v4 = if let Some(addr) = self.designated.get_by_right(dom) {
+                addr.to_owned()
+            } else {
+                self.alloc.alloc_or(&self.range)?.addr
+            };
+            let freed = self.map.push(v4, dom.to_owned());
             for ip in freed {
                 if let Some((ip, domain)) = ip {
                     self.alloc.unset(ip.into())

@@ -27,14 +27,12 @@ pub struct Args {
 #[derive(Subcommand, Serialize, Deserialize, Clone, Debug)]
 pub enum ArgMode {
     /// Specify config by a file
-    File {
-        path: PathBuf
-    },
+    File { path: PathBuf },
     /// Specify config by cmd args
     Args(#[command(flatten)] IArgs),
 }
 
-#[derive(Debug, Clone, Parser, Serialize, Deserialize)]         
+#[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 pub struct IArgs {
     /// Proxy URL in the form proto://[username[:password]@]host:port
     #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL")]
@@ -56,6 +54,9 @@ pub struct IArgs {
     pub bypass: Vec<IpAddr>,
 
     pub state: Option<PathBuf>,
+
+    #[arg(long)]
+    pub designated: Option<PathBuf>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]

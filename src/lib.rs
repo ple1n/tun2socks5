@@ -13,11 +13,17 @@ use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
     IpStackConfig,
 };
-use log::warn;
+use log::{info, warn};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
 use std::{
-    collections::{HashMap, VecDeque}, fmt::Debug, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, ops::{DerefMut, RangeInclusive}, process::exit, sync::Arc, time::Duration
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    ops::{DerefMut, RangeInclusive},
+    process::exit,
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -67,7 +73,7 @@ where
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
-    let vdns = Some(
+    let mut vdns = Some(
         if let Some(ref pa) = args.state
             && pa.exists()
         {
@@ -77,6 +83,14 @@ where
             VirtDNS::default(4096)?
         },
     );
+    if let Some(fp) = args.designated {
+        info!("load user-designated name mappings from {:?}", &fp);
+        let mut f = tokio::fs::File::open(fp).await?;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).await?;
+        let desig = serde_json::from_str(&buf)?;
+        vdns.as_mut().unwrap().designated = desig;
+    }
     let vdns = Arc::new(RwLock::new(vdns));
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr = match args.proxy.proxy_type {
@@ -117,7 +131,7 @@ where
                         let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
-                                // This kind of error causes mid-connection drop. 
+                                // This kind of error causes mid-connection drop.
                                 // An error in TCP is handled by state transition internally.
                                 log::error!("Error that causes drop. {} {:?}", info, err);
                             }

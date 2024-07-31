@@ -7,7 +7,7 @@ const MTU: u16 = u16::MAX;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    let mut args = Args::parse();
+    let args = Args::parse();
     let iargs: IArgs = match args.args {
         ArgMode::File { path } => {
             log::info!("Reading from {:?}", &path);
