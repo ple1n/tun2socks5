@@ -1,5 +1,6 @@
 use crate::{Error, Result};
 use clap::{Parser, Subcommand};
+use nsproxy_common::UniqueFile;
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::UserKey;
 use std::{
@@ -57,6 +58,13 @@ pub struct IArgs {
 
     #[arg(long)]
     pub designated: Option<PathBuf>,
+
+    /// for self identifying. EdgeIndex
+    #[arg(long)]
+    pub id: Option<usize>,
+    /// for self identifying
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]

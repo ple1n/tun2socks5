@@ -1,4 +1,5 @@
 #![feature(let_chains)]
+#![feature(decl_macro)]
 
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
@@ -8,6 +9,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
+use futures::{SinkExt, StreamExt};
 use id_alloc::NetRange;
 use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
@@ -33,6 +35,7 @@ use tokio::{
         mpsc::{Receiver, Sender},
         Mutex, RwLock,
     },
+    time::Instant,
 };
 use udp_stream::UdpStream;
 pub use {
@@ -58,6 +61,10 @@ const DNS_PORT: u16 = 53;
 static TASK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::atomic::Ordering::Relaxed;
 
+macro aok($t:ty) {
+    anyhow::Result::<$t, anyhow::Error>::Ok(())
+}
+
 pub async fn main_entry<D>(
     device: D,
     mtu: u16,
@@ -69,6 +76,27 @@ pub async fn main_entry<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    use tarpc::serde_transport::unix;
+    let p = unix::TempPathBuf::new(TMP_RPC_PATH);
+    use futures::channel::mpsc::unbounded;
+    use futures::StreamExt;
+    use nsproxy_common::rpc::*;
+    use tarpc::tokio_serde::formats::*;
+    let mut rpc = unix::connect(p, Bincode::<FromServer, FromClient>::default).await?;
+    let (mut sx, mut rx) = unbounded::<FromClient>();
+
+    tokio::spawn(
+        #[allow(unreachable_code)]
+        async move {
+            loop {
+                if let Some(d) = rx.next().await {
+                    rpc.send(d).await?;
+                }
+            }
+            aok!(())
+        },
+    );
+
     let server_addr = args.proxy.addr;
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
@@ -88,7 +116,7 @@ where
         let mut f = tokio::fs::File::open(fp).await?;
         let mut buf = String::new();
         f.read_to_string(&mut buf).await?;
-        let desig = serde_json::from_str(&buf)?;
+        let desig: bimap::BiHashMap<Ipv4Addr, String> = serde_json::from_str(&buf)?;
         vdns.as_mut().unwrap().designated = desig;
     }
     let vdns = Arc::new(RwLock::new(vdns));
@@ -115,7 +143,12 @@ where
     });
 
     let mut ip_stack = ipstack::IpStack::new(conf, device);
+    let mut last_time = Instant::now();
     loop {
+        let du = Instant::now() - last_time;
+        sx.send(FromClient::Data(Data::LoopTime(du))).await?;
+        last_time = Instant::now();
+
         let ip_stack_stream = tokio::select! {
             k = ip_stack.accept() => k,
             _ = quit.recv() => break,
