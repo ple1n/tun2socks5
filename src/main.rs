@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
 
-    if let Err(err) = main_entry(device, MTU, true, iargs, rx, tx).await {
+    if let Err(err) = main_entry(device, MTU, true, iargs, rx, tx, None).await {
         log::trace!("main_entry error {}", err);
     }
 

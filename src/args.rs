@@ -65,6 +65,9 @@ pub struct IArgs {
     /// for self identifying
     #[arg(long)]
     pub name: Option<String>,
+    /// test stats gui with random data and nothing else
+    #[arg(long)]
+    pub test_stats: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]

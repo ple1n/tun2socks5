@@ -9,18 +9,20 @@ use crate::{
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt};
+use futures::{future::pending, SinkExt, StreamExt};
 use id_alloc::NetRange;
 use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
     IpStackConfig,
 };
 use log::{info, warn};
+use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
+    future::Future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::{DerefMut, RangeInclusive},
     process::exit,
@@ -72,31 +74,11 @@ pub async fn main_entry<D>(
     args: IArgs,
     mut quit: Receiver<()>,
     quit_sx: Sender<()>,
+    report: Option<Sender<FromClient>>,
 ) -> crate::Result<()>
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    use tarpc::serde_transport::unix;
-    let p = unix::TempPathBuf::new(TMP_RPC_PATH);
-    use futures::channel::mpsc::unbounded;
-    use futures::StreamExt;
-    use nsproxy_common::rpc::*;
-    use tarpc::tokio_serde::formats::*;
-    let mut rpc = unix::connect(p, Bincode::<FromServer, FromClient>::default).await?;
-    let (mut sx, mut rx) = unbounded::<FromClient>();
-
-    tokio::spawn(
-        #[allow(unreachable_code)]
-        async move {
-            loop {
-                if let Some(d) = rx.next().await {
-                    rpc.send(d).await?;
-                }
-            }
-            aok!(())
-        },
-    );
-
     let server_addr = args.proxy.addr;
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
@@ -142,11 +124,15 @@ where
         Result::<_>::Ok(())
     });
 
+    use nsproxy_common::rpc::*;
+
     let mut ip_stack = ipstack::IpStack::new(conf, device);
     let mut last_time = Instant::now();
     loop {
         let du = Instant::now() - last_time;
-        sx.send(FromClient::Data(Data::LoopTime(du))).await?;
+        if let Some(ref rp) = report {
+            let _ = rp.send(FromClient::Data(Data::LoopTime(du))).await;
+        }
         last_time = Instant::now();
 
         let ip_stack_stream = tokio::select! {
