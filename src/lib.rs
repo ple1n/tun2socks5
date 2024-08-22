@@ -15,7 +15,7 @@ use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
     IpStackConfig,
 };
-use log::{info, warn};
+use log::{error, info, warn};
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
@@ -48,7 +48,7 @@ pub use {
 
 mod args;
 mod directions;
-mod dns;
+pub mod dns;
 mod error;
 mod http;
 mod lru;
@@ -63,7 +63,7 @@ const DNS_PORT: u16 = 53;
 static TASK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::atomic::Ordering::Relaxed;
 
-macro aok($t:ty) {
+pub macro aok($t:ty) {
     anyhow::Result::<$t, anyhow::Error>::Ok(())
 }
 
@@ -79,29 +79,27 @@ pub async fn main_entry<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    use dns::VirtDNSAsync as VirtDNS;
     let server_addr = args.proxy.addr;
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
-    let mut vdns = Some(
-        if let Some(ref pa) = args.state
-            && pa.exists()
-        {
-            let re: DNSState<String, Ipv4Addr> = bincode::deserialize_from(std::fs::File::open(pa)?)?;
-            VirtDNS::from_state(4096, re)?
-        } else {
-            VirtDNS::default(4096)?
-        },
-    );
+    let mut vdns = if let Some(ref pa) = args.state
+        && pa.exists()
+    {
+        let re: DNSState<String, Ipv4Addr> = bincode::deserialize_from(std::fs::File::open(pa)?)?;
+        VirtDNS::from_state(4096, re)?
+    } else {
+        VirtDNS::default(4096)?
+    };
     if let Some(fp) = args.designated {
         info!("load user-designated name mappings from {:?}", &fp);
         let mut f = tokio::fs::File::open(fp).await?;
         let mut buf = String::new();
         f.read_to_string(&mut buf).await?;
         let desig: bimap::BiHashMap<Ipv4Addr, String> = serde_json::from_str(&buf)?;
-        vdns.as_mut().unwrap().designated = desig;
+        vdns.designated = desig;
     }
-    let vdns = Arc::new(RwLock::new(vdns));
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr = match args.proxy.proxy_type {
         ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)) as Arc<dyn ConnectionManager>,
@@ -115,8 +113,8 @@ where
         udp_timeout: Duration::from_secs(30),
         ..Default::default()
     };
-
-    let vd2 = vdns.clone();
+    let vh = vdns.handle.clone();
+    tokio::spawn(vdns.serve());
     tokio::spawn(async move {
         tokio::signal::unix::signal(SignalKind::terminate())?.recv().await;
         log::warn!("SIGTERM received. Dump state");
@@ -133,99 +131,90 @@ where
         if let Some(ref rp) = report {
             let _ = rp.send(FromClient::Data(Data::LoopTime(du))).await;
         }
-        last_time = Instant::now();
 
         let ip_stack_stream = tokio::select! {
             k = ip_stack.accept() => k,
             _ = quit.recv() => break,
         }?;
+
+        last_time = Instant::now();
+
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {
                 log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                let mut k = vdns.write().await;
-                if let Some(w) = k.deref_mut() {
-                    if let VDNSRES::Addr(dst) = w.process(tcp.peer_addr()) {
-                        drop(k);
-                        let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
-                        let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
-                                // This kind of error causes mid-connection drop.
-                                // An error in TCP is handled by state transition internally.
-                                log::error!("Error that causes drop. {} {:?}", info, err);
-                            }
-                            log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
-                        });
-                    } else {
-                        warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
-                    }
+                if let VDNSRES::Addr(dst) = vh.process(tcp.peer_addr()).await {
+                    let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
+                    let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
+                            // This kind of error causes mid-connection drop.
+                            // An error in TCP is handled by state transition internally.
+                            log::error!("Error that causes drop. {} {:?}", info, err);
+                        }
+                        log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
+                    });
+                } else {
+                    warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
                 }
             }
             IpStackStream::Udp(mut udp) => {
                 log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                let mut k = vdns.write().await;
-                if let Some(w) = k.deref_mut() {
-                    if let VDNSRES::Addr(dst) = w.process(udp.peer_addr()) {
-                        drop(k);
-                        let port = dst.port();
-                        // if dst.port() == DNS_PORT {
-                        //     if private_ip::is_private_ip(dst.ip()) {
-                        //         dst.set_ip(dns_addr);
-                        //     }
-                        // }
-                        let info = SessionInfo::new(udp.local_addr(), dst, IpProtocol::Udp);
-                        if port == DNS_PORT {
-                            match args.dns {
-                                ArgDns::OverTcp => {
-                                    let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
-                                    tokio::spawn(async move {
-                                        if let Err(err) = handle_dns_over_tcp_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
-                                            log::error!("{} error \"{:?}\"", info, err);
-                                        }
-                                        log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
-                                    });
-                                    continue;
-                                }
-                                ArgDns::Handled => {
-                                    let vdns = vdns.clone();
-                                    tokio::spawn(async move {
-                                        let mut pack = BytesMut::with_capacity(128);
-                                        while udp.read_buf(&mut pack).await? > 0 {
-                                            let k = {
-                                                let mut vdns = vdns.write().await;
-                                                if let Some(vdns) = vdns.deref_mut() {
-                                                    vdns.receive_query(&pack)?
-                                                } else {
-                                                    exit(0)
-                                                }
-                                            };
+                if let VDNSRES::Addr(dst) = vh.process(udp.peer_addr()).await {
+                    let port = dst.port();
+                    // if dst.port() == DNS_PORT {
+                    //     if private_ip::is_private_ip(dst.ip()) {
+                    //         dst.set_ip(dns_addr);
+                    //     }
+                    // }
+                    let info = SessionInfo::new(udp.local_addr(), dst, IpProtocol::Udp);
+                    if port == DNS_PORT {
+                        match args.dns {
+                            ArgDns::OverTcp => {
+                                let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
+                                tokio::spawn(async move {
+                                    if let Err(err) = handle_dns_over_tcp_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
+                                        log::error!("{} error \"{:?}\"", info, err);
+                                    }
+                                    log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
+                                });
+                                continue;
+                            }
+                            ArgDns::Handled => {
+                                let vh = vh.clone();
+                                tokio::spawn(async move {
+                                    let mut pack = BytesMut::with_capacity(256);
+                                    while udp.read_buf(&mut pack).await? > 0 {
+                                        let k = vh.receive_query(&pack).await;
+                                        if let Ok(k) = k {
                                             udp.write_all(&k).await?;
-                                            pack.clear();
+                                        } else {
+                                            error!("udp:dns error decoding {:?}", k);
                                         }
-                                        crate::Result::<()>::Ok(())
-                                    });
-                                    continue;
-                                }
-                                ArgDns::Direct => {}
+                                        pack.clear();
+                                    }
+                                    crate::Result::<()>::Ok(())
+                                });
+                                continue;
                             }
+                            ArgDns::Direct => {}
                         }
-                        let proxy_handler = mgr.new_proxy_handler(info.clone(), true).await?;
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_udp_associate_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
-                                log::error!("{} error \"{:?}\"", info, err);
-                                println!("{}", err);
-                            }
-                            log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
-                        });
-                    } else {
-                        warn!("Invalid VirtDNS Addr {}", udp.peer_addr());
                     }
+                    let proxy_handler = mgr.new_proxy_handler(info.clone(), true).await?;
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_udp_associate_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
+                            log::error!("{} error \"{:?}\"", info, err);
+                            println!("{}", err);
+                        }
+                        log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
+                    });
+                } else {
+                    warn!("Invalid VirtDNS Addr {}", udp.peer_addr());
                 }
             }
         }
     }
     if let Some(ref pa) = args.state {
-        let dump = vd2.write().await.take().unwrap().to_state();
+        let dump = vh.to_state().await;
         let by = bincode::serialize(&dump)?;
         tokio::fs::write(pa, &by).await?;
         log::info!("State dumped");
@@ -273,9 +262,10 @@ async fn handle_udp_associate_session(
     use socks5_impl::protocol::{StreamOperation, UdpHeader};
     let mut server = TcpStream::connect(server_addr).await?;
     let session_info = proxy_handler.lock().await.get_session_info();
-    log::info!("Beginning {}", session_info);
+    log::info!("{}", session_info);
 
     let udp_addr = handle_proxy_session(&mut server, proxy_handler).await?;
+
     let udp_addr = udp_addr.ok_or(anyhow!("udp associate failed"))?;
 
     let mut udp_server = UdpStream::connect(udp_addr).await?;
@@ -324,8 +314,6 @@ async fn handle_udp_associate_session(
         }
     }
 
-    log::info!("Ending {}", session_info);
-
     Ok(())
 }
 
@@ -336,10 +324,8 @@ async fn handle_dns_over_tcp_session(
     ipv6_enabled: bool,
 ) -> crate::Result<()> {
     let mut server = TcpStream::connect(server_addr).await?;
-
     let session_info = proxy_handler.lock().await.get_session_info();
-    log::info!("Beginning {}", session_info);
-
+    log::info!("DNS over TCP {}", session_info);
     let _ = handle_proxy_session(&mut server, proxy_handler).await?;
 
     let mut buf1 = [0_u8; 4096];
@@ -406,8 +392,6 @@ async fn handle_dns_over_tcp_session(
             }
         }
     }
-
-    log::info!("Ending {}", session_info);
 
     Ok(())
 }
