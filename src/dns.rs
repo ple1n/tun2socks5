@@ -359,7 +359,7 @@ impl VirtDNSHandle {
     }
     pub async fn process(&self, addr: SocketAddr) -> VDNSRES {
         let (sx, rx) = oneshot::channel();
-        trace!("virtdns: resolve {}", addr);
+        info!("virtdns: resolve {}", addr);
         self.sx_addr.send((addr, sx)).unwrap();
         rx.await.unwrap()
     }

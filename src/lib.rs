@@ -125,19 +125,13 @@ where
     use nsproxy_common::rpc::*;
 
     let mut ip_stack = ipstack::IpStack::new(conf, device);
-    let mut last_time = Instant::now();
     loop {
-        let du = Instant::now() - last_time;
-        if let Some(ref rp) = report {
-            let _ = rp.send(FromClient::Data(Data::LoopTime(du))).await;
-        }
 
+        log::info!("Wait for new stream");
         let ip_stack_stream = tokio::select! {
             k = ip_stack.accept() => k,
             _ = quit.recv() => break,
         }?;
-
-        last_time = Instant::now();
 
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {
@@ -181,6 +175,7 @@ where
                             }
                             ArgDns::Handled => {
                                 let vh = vh.clone();
+                                info!("virtdns spawn to reply");
                                 tokio::spawn(async move {
                                     let mut pack = BytesMut::with_capacity(256);
                                     while udp.read_buf(&mut pack).await? > 0 {
