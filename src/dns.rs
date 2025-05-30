@@ -1,16 +1,23 @@
 use anyhow::{anyhow, bail};
+use concurrent_map::{ConcurrentMap, Maximum, Minimum};
 use futures::{FutureExt, SinkExt, StreamExt};
+use id_alloc::lock_alloc::Alloc;
+use id_alloc::opool::RcGuard;
 use log::{info, trace};
+use quick_cache::sync::Cache;
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::Address;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{net::IpAddr, str::FromStr};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use trust_dns_proto::op::MessageType;
 use trust_dns_proto::{
@@ -90,110 +97,18 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
     Ok(message)
 }
 
-use crate::aok;
 use crate::error::Result;
 use crate::lru::BijectiveLRU;
 use bimap::BiMap;
-use id_alloc::{IDAlloc, Ipv4A};
+use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A};
 use id_alloc::{Ipv4Network, NetRange};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::ops::RangeInclusive;
-
-pub struct VirtDNS {
-    /// IP -> Domain when getting TCP packets
-    /// Domain -> IP when getting DNS
-    pub map: BijectiveLRU<Ipv4Addr, String>,
-    /// User designated name mappings
-    pub designated: BiMap<Ipv4Addr, String>,
-    pub subnet: Ipv4Network,
-    pub range: RangeInclusive<Ipv4A>,
-    pub alloc: IDAlloc<Ipv4A>,
-}
+use std::ops::{Deref, RangeInclusive};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DNSState<R: Hash + Eq, L: Hash + Eq> {
     pub map: HashMap<R, L>,
     pub subnet: Ipv4Network,
-    pub alloc: IDAlloc<Ipv4A>,
-}
-
-impl VirtDNS {
-    pub fn default(cap: usize) -> Result<Self> {
-        let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
-        Ok(VirtDNS {
-            map: BijectiveLRU::new(NonZeroUsize::try_from(cap)?),
-            designated: Default::default(),
-            range: subnet.range(0),
-            alloc: Default::default(),
-            subnet,
-        })
-    }
-    pub fn from_state(cap: usize, sta: DNSState<String, Ipv4Addr>) -> Result<Self> {
-        log::info!("Resume DNS state. {} records", sta.map.len());
-        let map = BijectiveLRU::from_map(NonZeroUsize::try_from(cap)?, sta.map);
-        Ok(Self {
-            map,
-            designated: Default::default(),
-            range: sta.subnet.range(0),
-            subnet: sta.subnet,
-            alloc: sta.alloc,
-        })
-    }
-    pub fn to_state(self) -> DNSState<String, Ipv4Addr> {
-        DNSState {
-            map: self.map.map,
-            subnet: self.subnet,
-            alloc: self.alloc,
-        }
-    }
-    pub fn alloc(&mut self, dom: &str) -> Result<&Ipv4Addr> {
-        if self.map.rcontains(dom) {
-        } else {
-            let v4 = if let Some(addr) = self.designated.get_by_right(dom) {
-                addr.to_owned()
-            } else {
-                self.alloc.alloc_or(&self.range)?.addr
-            };
-            let freed = self.map.push(v4, dom.to_owned());
-            for ip in freed {
-                if let Some((ip, domain)) = ip {
-                    self.alloc.unset(ip.into())
-                }
-            }
-        }
-        Ok(self.map.rget(dom).unwrap())
-    }
-    pub fn receive_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let message = parse_data_to_dns_message(data, false)?;
-        let qname = extract_domain_from_dns_message(&message)?;
-        log::info!("VirtDNS {}", qname);
-        let ip = self.alloc(&qname)?;
-        let message = build_dns_response(message, &qname, ip.to_owned().into(), 5)?;
-        Ok(message.to_vec()?)
-    }
-    pub fn process(&mut self, addr: SocketAddr) -> VDNSRES {
-        match addr {
-            SocketAddr::V4(v4) => {
-                // this takes priority
-                if let Some(desig) = self.designated.get_by_left(&v4.ip()) {
-                    VDNSRES::Addr(Address::DomainAddress(desig.to_owned(), v4.port()))
-                } else {
-                    if self.range.contains(&v4.ip().to_owned().into()) {
-                        // Exclusive range for Virt DNS
-                        if let Some(ad) = self.map.lget(v4.ip()) {
-                            VDNSRES::Addr(Address::DomainAddress(ad.to_string(), v4.port()))
-                        } else {
-                            VDNSRES::ERR
-                        }
-                        // Reset
-                    } else {
-                        VDNSRES::Addr(Address::SocketAddress(v4.into()))
-                    }
-                }
-            }
-            k => VDNSRES::Addr(k.into()),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -202,170 +117,163 @@ pub enum VDNSRES {
     ERR,
 }
 
-use futures::channel::oneshot;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-type DNSStateTy = DNSState<String, Ipv4Addr>;
 pub struct VirtDNSAsync {
-    /// IP -> Domain when getting TCP packets
-    /// Domain -> IP when getting DNS
-    pub map: BijectiveLRU<Ipv4Addr, String>,
     /// User designated name mappings
     pub designated: BiMap<Ipv4Addr, String>,
     pub subnet: Ipv4Network,
     pub range: RangeInclusive<Ipv4A>,
-    pub alloc: IDAlloc<Ipv4A>,
-    reqs_domain: UnboundedReceiver<(String, oneshot::Sender<Result<Ipv4Addr>>)>,
-    reqs_addr: UnboundedReceiver<(SocketAddr, oneshot::Sender<VDNSRES>)>,
-    reqs_state: UnboundedReceiver<oneshot::Sender<DNSState<String, Ipv4Addr>>>,
     pub handle: VirtDNSHandle,
 }
 
+type CacheEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
+// type CacheEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
+
 #[derive(Clone)]
 pub struct VirtDNSHandle {
-    sx_domain: UnboundedSender<(String, oneshot::Sender<Result<Ipv4Addr>>)>,
-    sx_addr: UnboundedSender<(SocketAddr, oneshot::Sender<VDNSRES>)>,
-    sx_state: UnboundedSender<oneshot::Sender<DNSState<String, Ipv4Addr>>>,
+    domains: ConcurrentMap<Ipv4A, IPKeyEntry>,
+    lru: Arc<quick_cache::sync::Cache<Ipv4A, CacheEntry>>,
+    lru_domains: Arc<quick_cache::sync::Cache<String, CacheEntry>>,
+    alloc: lock_alloc::Alloc<Ipv4A>,
+    range: RangeInclusive<Ipv4A>,
 }
+
+#[derive(Clone)]
+struct IPKeyEntry {
+    domain: String,
+    lifetime: CacheEntry,
+}
+
+const LRU: usize = 128;
+
+// DNS metrics
+const LRU_IP_HITS: AtomicUsize = AtomicUsize::new(0);
+const DOMAIN_HITS: AtomicUsize = AtomicUsize::new(0);
+const IP_HITS: AtomicUsize = AtomicUsize::new(0);
 
 impl VirtDNSAsync {
     pub fn default(cap: usize) -> Result<Self> {
         let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
-        let (sx_domain, reqs_domain) = unbounded_channel();
-        let (sx_addr, reqs_addr) = unbounded_channel();
-        let (sx_state, reqs_state) = unbounded_channel();
+        let range = subnet.range(0);
 
         Ok(Self {
-            map: BijectiveLRU::new(NonZeroUsize::try_from(cap)?),
             designated: Default::default(),
-            range: subnet.range(0),
-            alloc: Default::default(),
-            subnet,
-            reqs_addr,
-            reqs_state,
-            reqs_domain,
+            range: range.clone(),
             handle: VirtDNSHandle {
-                sx_addr,
-                sx_domain,
-                sx_state,
+                domains: Default::default(),
+                lru: Cache::new(LRU).into(),
+                lru_domains: Cache::new(LRU).into(),
+                alloc: Alloc::init(
+                    Ipv4A {
+                        addr: subnet.ip(),
+                        host: 16,
+                    },
+                    cap,
+                ),
+                range,
             },
+            subnet,
         })
     }
     pub fn from_state(cap: usize, sta: DNSState<String, Ipv4Addr>) -> Result<Self> {
         log::info!("Resume DNS state. {} records", sta.map.len());
-        let (sx_domain, reqs_domain) = unbounded_channel();
-        let (sx_addr, reqs_addr) = unbounded_channel();
-        let (sx_state, reqs_state) = unbounded_channel();
-
-        let map = BijectiveLRU::from_map(NonZeroUsize::try_from(cap)?, sta.map);
+        let range = sta.subnet.range(0);
         Ok(Self {
-            map,
             designated: Default::default(),
-            range: sta.subnet.range(0),
+            range: range.clone(),
             subnet: sta.subnet,
-            alloc: sta.alloc,
-
-            reqs_addr,
-            reqs_state,
-            reqs_domain,
             handle: VirtDNSHandle {
-                sx_addr,
-                sx_domain,
-                sx_state,
+                lru: Cache::new(LRU).into(),
+                lru_domains: Cache::new(LRU).into(),
+                domains: Default::default(),
+                alloc: Alloc::init(
+                    Ipv4A {
+                        addr: sta.subnet.ip(),
+                        host: 16,
+                    },
+                    cap,
+                ),
+                range,
             },
         })
     }
     pub fn to_state(&self) -> DNSState<String, Ipv4Addr> {
         DNSState {
-            map: self.map.map.clone(),
+            map: self.handle.domains.iter().map(|(ip, dom)| (dom.domain, ip.addr)).collect(),
             subnet: self.subnet.clone(),
-            alloc: self.alloc.clone(),
-        }
-    }
-    pub async fn serve(mut self) {
-        loop {
-            futures::select! {
-                rx = self.reqs_domain.recv().fuse() => {
-                    let (domain, sx) = rx.unwrap();
-                    let mut process = |dom: &str| {
-                        if self.map.rcontains(dom) {
-                        } else {
-                            let v4 = if let Some(addr) = self.designated.get_by_right(dom) {
-                                addr.to_owned()
-                            } else {
-                                self.alloc.alloc_or(&self.range)?.addr
-                            };
-                            let freed = self.map.push(v4, dom.to_owned());
-                            for ip in freed {
-                                if let Some((ip, domain)) = ip {
-                                    self.alloc.unset(ip.into())
-                                }
-                            }
-                        }
-                        Result::Ok(self.map.rget(dom).unwrap().clone())
-                    };
-                    sx.send(process(&domain).map_err(anyhow::Error::from)).expect("send failed");
-                }
-                rx = self.reqs_addr.recv().fuse() => {
-                    let (addr, sx) = rx.unwrap();
-                    let back = match addr {
-                        SocketAddr::V4(v4) => {
-                            // this takes priority
-                            if let Some(desig) = self.designated.get_by_left(&v4.ip()) {
-                                VDNSRES::Addr(Address::DomainAddress(desig.to_owned(), v4.port()))
-                            } else {
-                                if self.range.contains(&v4.ip().to_owned().into()) {
-                                    // Exclusive range for Virt DNS
-                                    if let Some(ad) = self.map.lget(v4.ip()) {
-                                        VDNSRES::Addr(Address::DomainAddress(ad.to_string(), v4.port()))
-                                    } else {
-                                        VDNSRES::ERR
-                                    }
-                                    // Reset
-                                } else {
-                                    VDNSRES::Addr(Address::SocketAddress(v4.into()))
-                                }
-                            }
-                        }
-                        k => VDNSRES::Addr(k.into()),
-                    };
-                    sx.send(back).expect("send failed");
-                },
-                rx = self.reqs_state.recv().fuse() => {
-                    let sx = rx.unwrap();
-                    sx.send(self.to_state()).expect("send failed");
-
-                }
-            }
         }
     }
 }
 
 impl VirtDNSHandle {
-    pub async fn alloc(&self, dom: String) -> Result<Ipv4Addr> {
-        let (sx, rx) = oneshot::channel();
-        trace!("virtdns: alloc {}", dom);
-        self.sx_domain.send((dom, sx))?;
-        let k = rx.await??;
-        Ok(k)
+    pub async fn periodic_report(self) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                log::info!("LRU size = {}, DNS map = {}", self.lru.len(), self.domains.len());
+            }
+        });
     }
-    pub async fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn alloc(&self, dom: String) -> Result<Ipv4Addr> {
+        trace!("virtdns: alloc {}", dom);
+        IP_HITS.fetch_add(1, Ordering::SeqCst);
+        if let Some(hit) = self.lru_domains.get(&dom) {
+            let addr = hit.addr;
+            Ok(addr)
+        } else {
+            let ip = Arc::new(self.alloc.pool.clone().get_rc());
+            let addr = ip.addr;
+            self.domains.insert(
+                **ip,
+                IPKeyEntry {
+                    domain: dom.clone(),
+                    lifetime: ip.clone(),
+                },
+            );
+            self.lru_domains.insert(dom, ip);
+            Ok(addr)
+        }
+    }
+    pub fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
-        info!("VirtDNS {}", qname);
-        let ip = self.alloc(qname.clone()).await?;
+        info!("VirtDNS recved {}", qname);
+        let ip = self.alloc(qname.clone())?;
         let message = build_dns_response(message, &qname, ip.into(), 5)?;
         Ok(message.to_vec()?)
     }
-    pub async fn process(&self, addr: SocketAddr) -> VDNSRES {
-        let (sx, rx) = oneshot::channel();
+    pub fn process(&self, addr: SocketAddr) -> VDNSRES {
         trace!("virtdns: resolve {}", addr);
-        self.sx_addr.send((addr, sx)).unwrap();
-        rx.await.unwrap()
-    }
-    pub async fn to_state(&self) -> DNSStateTy {
-        let (sx, rx) = oneshot::channel();
-        self.sx_state.send(sx).unwrap();
-        rx.await.unwrap()
+        match addr {
+            SocketAddr::V4(v4) => {
+                // this takes priority
+                if self.range.contains(&v4.ip().to_owned().into()) {
+                    let dns_hit = || DOMAIN_HITS.fetch_add(1, Ordering::SeqCst);
+                    // Exclusive range for Virt DNS
+                    let v4a = Ipv4A::new(*v4.ip(), self.alloc.interval.host);
+                    // visit cache first
+                    let g = self.lru.get(&v4a);
+                    if let Some(cached) = g {
+                        dns_hit();
+                        LRU_IP_HITS.fetch_add(1, Ordering::SeqCst);
+                        let addr = cached.addr;
+                        VDNSRES::Addr(Address::DomainAddress(addr.to_string(), v4.port()))
+                    } else {
+                        // not cached
+                        if let Some(IPKeyEntry { domain, lifetime }) = self.domains.get(&v4a) {
+                            self.lru.insert(v4a, lifetime);
+                            dns_hit();
+                            VDNSRES::Addr(Address::DomainAddress(domain, v4.port()))
+                        } else {
+                            VDNSRES::ERR
+                        }
+                    }
+
+                    // Reset
+                } else {
+                    VDNSRES::Addr(Address::SocketAddress(v4.into()))
+                }
+            }
+            k => VDNSRES::Addr(k.into()),
+        }
     }
 }

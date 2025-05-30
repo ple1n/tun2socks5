@@ -3,7 +3,7 @@
 
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    dns::{DNSState, VirtDNS, VDNSRES},
+    dns::{DNSState, VDNSRES},
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
@@ -114,7 +114,6 @@ where
         ..Default::default()
     };
     let vh = vdns.handle.clone();
-    tokio::spawn(vdns.serve());
     tokio::spawn(async move {
         tokio::signal::unix::signal(SignalKind::terminate())?.recv().await;
         log::warn!("SIGTERM received. Dump state");
@@ -142,7 +141,7 @@ where
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {
                 log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                if let VDNSRES::Addr(dst) = vh.process(tcp.peer_addr()).await {
+                if let VDNSRES::Addr(dst) = vh.process(tcp.peer_addr()) {
                     let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
                     let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                     tokio::spawn(async move {
@@ -159,7 +158,7 @@ where
             }
             IpStackStream::Udp(mut udp) => {
                 log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                if let VDNSRES::Addr(dst) = vh.process(udp.peer_addr()).await {
+                if let VDNSRES::Addr(dst) = vh.process(udp.peer_addr()) {
                     let port = dst.port();
                     // if dst.port() == DNS_PORT {
                     //     if private_ip::is_private_ip(dst.ip()) {
@@ -182,9 +181,10 @@ where
                             ArgDns::Handled => {
                                 let vh = vh.clone();
                                 tokio::spawn(async move {
+                                    let vh = vh;
                                     let mut pack = BytesMut::with_capacity(256);
                                     while udp.read_buf(&mut pack).await? > 0 {
-                                        let k = vh.receive_query(&pack).await;
+                                        let k = vh.receive_query(&pack);
                                         if let Ok(k) = k {
                                             udp.write_all(&k).await?;
                                         } else {
@@ -214,9 +214,9 @@ where
         }
     }
     if let Some(ref pa) = args.state {
-        let dump = vh.to_state().await;
-        let by = bincode::serialize(&dump)?;
-        tokio::fs::write(pa, &by).await?;
+        // let dump = vh.to_state().await;
+        // let by = bincode::serialize(&dump)?;
+        // tokio::fs::write(pa, &by).await?;
         log::info!("State dumped");
     }
 

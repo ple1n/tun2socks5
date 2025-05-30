@@ -45,6 +45,7 @@ futures = "0.3.30"
 rand = "0.8.5"
 rand_distr = "0.4.3"
 quick_cache = "0.6.3"
+concurrent-map = "5.0.37"
 
 [dev-dependencies]
 rand = "0.8.5"
