@@ -58,11 +58,11 @@ pub struct IArgs {
 
     #[arg(long)]
     pub designated: Option<PathBuf>,
-
     /// for self identifying. EdgeIndex
     #[arg(long)]
     pub id: Option<usize>,
-    /// for self identifying
+    /// for self identifying. 
+    /// also used as default name when creating a new node
     #[arg(long)]
     pub name: Option<String>,
 }
