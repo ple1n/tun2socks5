@@ -3,7 +3,7 @@ use concurrent_map::{ConcurrentMap, Maximum, Minimum};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use log::{info, trace};
+use log::{info, trace, warn};
 use quick_cache::sync::Cache;
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::Address;
@@ -125,14 +125,13 @@ pub struct VirtDNSAsync {
     pub handle: VirtDNSHandle,
 }
 
-type CacheEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
-// type CacheEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
+type PoolEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
 
 #[derive(Clone)]
 pub struct VirtDNSHandle {
     domains: ConcurrentMap<Ipv4A, IPKeyEntry>,
-    lru: Arc<quick_cache::sync::Cache<Ipv4A, CacheEntry>>,
-    lru_domains: Arc<quick_cache::sync::Cache<String, CacheEntry>>,
+    lru: Arc<quick_cache::sync::Cache<Ipv4A, (PoolEntry, String)>>,
+    lru_domains: Arc<quick_cache::sync::Cache<String, PoolEntry>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
     range: RangeInclusive<Ipv4A>,
 }
@@ -140,7 +139,7 @@ pub struct VirtDNSHandle {
 #[derive(Clone)]
 struct IPKeyEntry {
     domain: String,
-    lifetime: CacheEntry,
+    lifetime: PoolEntry,
 }
 
 const LRU: usize = 128;
@@ -255,15 +254,16 @@ impl VirtDNSHandle {
                     if let Some(cached) = g {
                         dns_hit();
                         LRU_IP_HITS.fetch_add(1, Ordering::SeqCst);
-                        let addr = cached.addr;
+                        let addr = cached.1;
                         VDNSRES::Addr(Address::DomainAddress(addr.to_string(), v4.port()))
                     } else {
                         // not cached
                         if let Some(IPKeyEntry { domain, lifetime }) = self.domains.get(&v4a) {
-                            self.lru.insert(v4a, lifetime);
+                            self.lru.insert(v4a, (lifetime, domain.clone()));
                             dns_hit();
                             VDNSRES::Addr(Address::DomainAddress(domain, v4.port()))
                         } else {
+                            warn!("virtdns: address with no associated domain, {}", &v4);
                             VDNSRES::ERR
                         }
                     }
