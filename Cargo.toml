@@ -46,6 +46,7 @@ rand = "0.8.5"
 rand_distr = "0.4.3"
 quick_cache = "0.6.3"
 concurrent-map = "5.0.37"
+crossbeam = "0.8.4"
 
 [dev-dependencies]
 rand = "0.8.5"

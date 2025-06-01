@@ -51,7 +51,6 @@ mod directions;
 pub mod dns;
 mod error;
 mod http;
-mod lru;
 mod private_ip;
 mod proxy_handler;
 mod route_config;

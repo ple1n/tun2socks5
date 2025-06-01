@@ -1,15 +1,17 @@
 use anyhow::{anyhow, bail};
 use concurrent_map::{ConcurrentMap, Maximum, Minimum};
+use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
 use log::{info, trace, warn};
 use quick_cache::sync::Cache;
+use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::Address;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::hash::Hash;
+use std::hash::{Hash, RandomState};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -98,7 +100,7 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
 }
 
 use crate::error::Result;
-use crate::lru::BijectiveLRU;
+
 use bimap::BiMap;
 use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A};
 use id_alloc::{Ipv4Network, NetRange};
@@ -126,15 +128,38 @@ pub struct VirtDNSAsync {
 }
 
 type PoolEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
+type EvictedQ = Arc<SegQueue<Ipv4A>>;
 
 #[derive(Clone)]
 pub struct VirtDNSHandle {
-    domains: ConcurrentMap<Ipv4A, IPKeyEntry>,
-    lru: Arc<quick_cache::sync::Cache<Ipv4A, (PoolEntry, String)>>,
-    lru_domains: Arc<quick_cache::sync::Cache<String, PoolEntry>>,
+    f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
+    f_domain: Arc<Cache<String, PoolEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
     range: RangeInclusive<Ipv4A>,
+    evicted: EvictedQ,
 }
+
+#[derive(Clone)]
+/// Eviction is depedent on LRU(domain -> IP)
+struct IPEviction {
+    evicted: EvictedQ,
+}
+
+impl Lifecycle<String, PoolEntry> for IPEviction {
+    type RequestState = ();
+
+    fn begin_request(&self) -> Self::RequestState {}
+    fn on_evict(&self, state: &mut Self::RequestState, key: String, val: PoolEntry) {
+        log::info!("Evict {} -> {:?}", key, val);
+        self.evicted.push(**val);
+    }
+}
+
+// when a client queries DNS, an IP is allocated to a domain
+// the clients will believe the IP associates with the domain for indefinite time
+// there is no way to determine when the clients stop believing this
+// ofc there is usually an expiry time about DNS
+// here we just bound it with LRU, to prevent exhaustion of IP pool
 
 #[derive(Clone)]
 struct IPKeyEntry {
@@ -142,7 +167,7 @@ struct IPKeyEntry {
     lifetime: PoolEntry,
 }
 
-const LRU: usize = 128;
+const LRU: usize = 4096;
 
 // DNS metrics
 const LRU_IP_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -153,14 +178,21 @@ impl VirtDNSAsync {
     pub fn default(cap: usize) -> Result<Self> {
         let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
         let range = subnet.range(0);
-
+        let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
+        let ev: Arc<SegQueue<Ipv4A>> = Default::default();
         Ok(Self {
             designated: Default::default(),
             range: range.clone(),
             handle: VirtDNSHandle {
-                domains: Default::default(),
-                lru: Cache::new(LRU).into(),
-                lru_domains: Cache::new(LRU).into(),
+                f_domain: Arc::new(Cache::with(
+                    LRU,
+                    LRU as u64,
+                    UnitWeighter,
+                    DefaultHashBuilder::default(),
+                    IPEviction { evicted: ev.clone() },
+                )),
+                evicted: ev,
+                f_ip: concmap,
                 alloc: Alloc::init(
                     Ipv4A {
                         addr: subnet.ip(),
@@ -176,14 +208,22 @@ impl VirtDNSAsync {
     pub fn from_state(cap: usize, sta: DNSState<String, Ipv4Addr>) -> Result<Self> {
         log::info!("Resume DNS state. {} records", sta.map.len());
         let range = sta.subnet.range(0);
+        let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
+        let ev: Arc<SegQueue<Ipv4A>> = Default::default();
         Ok(Self {
             designated: Default::default(),
             range: range.clone(),
             subnet: sta.subnet,
             handle: VirtDNSHandle {
-                lru: Cache::new(LRU).into(),
-                lru_domains: Cache::new(LRU).into(),
-                domains: Default::default(),
+                f_domain: Arc::new(Cache::with(
+                    LRU,
+                    LRU as u64,
+                    UnitWeighter,
+                    DefaultHashBuilder::default(),
+                    IPEviction { evicted: ev.clone() },
+                )),
+                f_ip: concmap,
+                evicted: ev,
                 alloc: Alloc::init(
                     Ipv4A {
                         addr: sta.subnet.ip(),
@@ -197,7 +237,7 @@ impl VirtDNSAsync {
     }
     pub fn to_state(&self) -> DNSState<String, Ipv4Addr> {
         DNSState {
-            map: self.handle.domains.iter().map(|(ip, dom)| (dom.domain, ip.addr)).collect(),
+            map: self.handle.f_ip.iter().map(|(ip, dom)| (dom.domain, ip.addr)).collect(),
             subnet: self.subnet.clone(),
         }
     }
@@ -205,31 +245,41 @@ impl VirtDNSAsync {
 
 impl VirtDNSHandle {
     pub async fn periodic_report(self) {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                log::info!("LRU size = {}, DNS map = {}", self.lru.len(), self.domains.len());
-            }
-        });
+        // tokio::spawn(async move {
+        //     loop {
+        //         tokio::time::sleep(Duration::from_secs(1)).await;
+        //         log::info!("LRU size = {}, DNS map = {}", self.lru_domains.len(), self.domains.len());
+        //     }
+        // });
     }
     pub fn alloc(&self, dom: String) -> Result<Ipv4Addr> {
         trace!("virtdns: alloc {}", dom);
+        self.apply_evictions();
         IP_HITS.fetch_add(1, Ordering::SeqCst);
-        if let Some(hit) = self.lru_domains.get(&dom) {
+        if let Some(hit) = self.f_domain.get(&dom) {
             let addr = hit.addr;
             Ok(addr)
         } else {
-            let ip = Arc::new(self.alloc.pool.clone().get_rc());
-            let addr = ip.addr;
-            self.domains.insert(
-                **ip,
+            let own = Arc::new(self.alloc.pool.clone().get_rc());
+            let addr = own.addr;
+            self.f_ip.insert(
+                **own,
                 IPKeyEntry {
                     domain: dom.clone(),
-                    lifetime: ip.clone(),
+                    lifetime: own.clone(),
                 },
             );
-            self.lru_domains.insert(dom, ip);
+            self.f_domain.insert(dom, own);
             Ok(addr)
+        }
+    }
+    pub fn apply_evictions(&self) {
+        loop {
+            if let Some(ev) = self.evicted.pop() {
+                self.f_ip.remove(&ev);
+            } else {
+                break;
+            }
         }
     }
     pub fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
@@ -249,23 +299,13 @@ impl VirtDNSHandle {
                     let dns_hit = || DOMAIN_HITS.fetch_add(1, Ordering::SeqCst);
                     // Exclusive range for Virt DNS
                     let v4a = Ipv4A::new(*v4.ip(), self.alloc.interval.host);
-                    // visit cache first
-                    let g = self.lru.get(&v4a);
-                    if let Some(cached) = g {
+
+                    if let Some(IPKeyEntry { domain, lifetime }) = self.f_ip.get(&v4a) {
                         dns_hit();
-                        LRU_IP_HITS.fetch_add(1, Ordering::SeqCst);
-                        let addr = cached.1;
-                        VDNSRES::Addr(Address::DomainAddress(addr.to_string(), v4.port()))
+                        VDNSRES::Addr(Address::DomainAddress(domain, v4.port()))
                     } else {
-                        // not cached
-                        if let Some(IPKeyEntry { domain, lifetime }) = self.domains.get(&v4a) {
-                            self.lru.insert(v4a, (lifetime, domain.clone()));
-                            dns_hit();
-                            VDNSRES::Addr(Address::DomainAddress(domain, v4.port()))
-                        } else {
-                            warn!("virtdns: address with no associated domain, {}", &v4);
-                            VDNSRES::ERR
-                        }
+                        warn!("virtdns: address with no associated domain, {}", &v4);
+                        VDNSRES::ERR
                     }
 
                     // Reset
