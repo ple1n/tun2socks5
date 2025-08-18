@@ -261,6 +261,7 @@ impl VirtDNSHandle {
             Ok(addr)
         } else {
             let own = Arc::new(self.alloc.pool.clone().get_rc());
+            trace!("got object from pool");
             let addr = own.addr;
             self.f_ip.insert(
                 **own,

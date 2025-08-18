@@ -66,6 +66,8 @@ pub macro aok($t:ty) {
     anyhow::Result::<$t, anyhow::Error>::Ok(())
 }
 
+const POOL_SIZE: usize = 40000;
+
 pub async fn main_entry<D>(
     device: D,
     mtu: u16,
@@ -83,13 +85,15 @@ where
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
-    let mut vdns = if let Some(ref pa) = args.state
-        && pa.exists()
-    {
-        let re: DNSState<String, Ipv4Addr> = bincode::deserialize_from(std::fs::File::open(pa)?)?;
-        VirtDNS::from_state(4096, re)?
+    let mut vdns = if let Some(ref pa) = args.state {
+        if pa.exists() {
+            let re: DNSState<String, Ipv4Addr> = bincode::deserialize_from(std::fs::File::open(pa)?)?;
+            VirtDNS::from_state(POOL_SIZE, re)?
+        } else {
+            VirtDNS::default(POOL_SIZE)?
+        }
     } else {
-        VirtDNS::default(4096)?
+        VirtDNS::default(POOL_SIZE)?
     };
     if let Some(fp) = args.designated {
         info!("load user-designated name mappings from {:?}", &fp);
@@ -124,7 +128,6 @@ where
 
     let mut ip_stack = ipstack::IpStack::new(conf, device);
     loop {
-
         log::info!("Wait for new stream");
         let ip_stack_stream = tokio::select! {
             k = ip_stack.accept() => k,
