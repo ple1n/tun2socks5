@@ -4,7 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use log::{info, trace, warn};
+use tracing::{info, trace, warn};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::{Deserialize, Serialize};
@@ -150,7 +150,7 @@ impl Lifecycle<String, PoolEntry> for IPEviction {
 
     fn begin_request(&self) -> Self::RequestState {}
     fn on_evict(&self, state: &mut Self::RequestState, key: String, val: PoolEntry) {
-        log::info!("Evict {} -> {:?}", key, val);
+        info!("Evict {} -> {:?}", key, val);
         self.evicted.push(**val);
     }
 }
@@ -206,7 +206,7 @@ impl VirtDNSAsync {
         })
     }
     pub fn from_state(cap: usize, sta: DNSState<String, Ipv4Addr>) -> Result<Self> {
-        log::info!("Resume DNS state. {} records", sta.map.len());
+        info!("Resume DNS state. {} records", sta.map.len());
         let range = sta.subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
@@ -248,7 +248,7 @@ impl VirtDNSHandle {
         // tokio::spawn(async move {
         //     loop {
         //         tokio::time::sleep(Duration::from_secs(1)).await;
-        //         log::info!("LRU size = {}, DNS map = {}", self.lru_domains.len(), self.domains.len());
+        //         info!("LRU size = {}, DNS map = {}", self.lru_domains.len(), self.domains.len());
         //     }
         // });
     }

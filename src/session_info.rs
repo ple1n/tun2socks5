@@ -43,7 +43,8 @@ static SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 impl SessionInfo {
     pub fn new(src: SocketAddr, dst: Address, protocol: IpProtocol) -> Self {
-        let id = SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // let id = SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = 0;
         Self { src, dst, protocol, id }
     }
 }

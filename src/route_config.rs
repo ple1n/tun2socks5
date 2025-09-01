@@ -1,7 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use anyhow::bail;
 use crate::Result;
+use anyhow::bail;
+
+use tracing::*;
 
 pub const TUN_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 33));
 pub const TUN_NETMASK: IpAddr = IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0));
@@ -18,7 +20,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, dns_addr: Option<I
     let tun_name = format!("\"{}\"", tun_name);
     let args = &["interface", "ip", "set", "dns", &tun_name, "static", &dns_addr.to_string()];
     run_command("netsh", args)?;
-    log::info!("netsh {:?}", args);
+    info!("netsh {:?}", args);
 
     // 2. Route all traffic to the adapter, here the destination is adapter's gateway
     // command: `route add 0.0.0.0 mask 0.0.0.0 10.1.0.1 metric 6`
@@ -26,7 +28,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, dns_addr: Option<I
     let gateway = TUN_GATEWAY.to_string();
     let args = &["add", &unspecified, "mask", &unspecified, &gateway, "metric", "6"];
     run_command("route", args)?;
-    log::info!("route {:?}", args);
+    info!("route {:?}", args);
 
     let old_gateway = get_default_gateway()?;
     unsafe {
@@ -38,7 +40,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, dns_addr: Option<I
     for bypass_ip in bypass_ips {
         let args = &["add", &bypass_ip.to_string(), &old_gateway.to_string(), "metric", "1"];
         run_command("route", args)?;
-        log::info!("route {:?}", args);
+        info!("route {:?}", args);
     }
 
     Ok(())
@@ -62,7 +64,7 @@ pub fn config_settings(bypass_ips: &[IpAddr], tun_name: &str, _dns_addr: Option<
         let cmd = format!("ip route add {} {}", bypass_ip, stdout.trim());
         let args = &["-c", &cmd];
         if let Err(err) = run_command("sh", args) {
-            log::trace!("run_command {}", err);
+            trace!("run_command {}", err);
         }
     }
 

@@ -1,20 +1,33 @@
+use std::sync::Arc;
+
 use clap::Parser;
+use ipstack::TUNDev;
+use tracing::info;
+use tracing::trace;
 use tun2socks5::{config_restore, config_settings, main_entry, ArgMode, Args, IArgs, TUN_GATEWAY, TUN_IPV4, TUN_NETMASK};
 
 // const MTU: u16 = 1500;
 const MTU: u16 = u16::MAX;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use tun_rs::{AsyncDevice, DeviceBuilder, ToIpv4Address};
+
+fn main() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(12).build().unwrap();
+    rt.block_on(main_fn())?;
+
+    anyhow::Result::Ok(())
+}
+
+async fn main_fn() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let args = Args::parse();
     let iargs: IArgs = match args.args {
         ArgMode::File { path } => {
-            log::info!("Reading from {:?}", &path);
+            info!("Reading from {:?}", &path);
             let mut f = std::fs::File::open(path)?;
             let iargs: IArgs = serde_json::from_reader(&mut f)?;
             // Be aware of conflicts
-            log::info!("State file is {:?}", iargs.state);
+            info!("State file is {:?}", iargs.state);
             iargs
         }
         ArgMode::Args(args) => args,
@@ -26,20 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default = format!("{}={:?}", module_path!(), args.verbosity);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
 
-    let mut config = tun::Configuration::default();
-    config.address(TUN_IPV4).netmask(TUN_NETMASK).mtu(MTU as i32).up();
-    config.destination(TUN_GATEWAY).name(&tun_name);
+    let mut dev_builder = DeviceBuilder::new()
+        .ipv4(TUN_IPV4, TUN_NETMASK.ipv4().unwrap(), Some(TUN_GATEWAY))
+        .mtu(MTU);
 
     #[cfg(target_os = "linux")]
-    config.platform(|config| {
-        config.packet_information(true);
-        config.apply_settings(false);
-    });
+    {
+        dev_builder = dev_builder.packet_information(true).multi_queue(true);
+    }
 
-    #[cfg(target_os = "windows")]
-    config.platform(|config| {
-        config.initialize(Some(12324323423423434234_u128));
-    });
+    let device: TUNDev = Arc::new(dev_builder.build_async()?);
 
     #[allow(unused_mut, unused_assignments)]
     let mut setup = true;
@@ -51,8 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config_settings(&bypass_ips, &tun_name, Some(iargs.dns_addr))?;
         }
     }
-
-    let device = tun::create_as_async(&config)?;
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     if setup {
@@ -67,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     if let Err(err) = main_entry(device, MTU, true, iargs, rx, tx, None).await {
-        log::trace!("main_entry error {}", err);
+        trace!("main_entry error {}", err);
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]

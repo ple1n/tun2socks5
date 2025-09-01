@@ -15,13 +15,11 @@ dotenvy = "0.15"
 env_logger = "0.10"
 httparse = "1.8"
 ipstack = { path = "../ipstack" }
-log = "0.4"
 regex = "1.10"
 socks5-impl = { path = "../socks5-impl" }
 thiserror = "1.0"
 tokio = { version = "1.34", features = ["full"] }
 trust-dns-proto = "0.23"
-tun = { path = "../rust-tun", features = ["async"] }
 udp-stream = { version = "0.0", default-features = false }
 unicase = "2.7"
 url = "2.5"
@@ -47,6 +45,8 @@ rand_distr = "0.4.3"
 quick_cache = "0.6.3"
 concurrent-map = "5.0.37"
 crossbeam = "0.8.4"
+tun-rs = { workspace = true }
+tracing = "0.1.41"
 
 [dev-dependencies]
 rand = "0.8.5"

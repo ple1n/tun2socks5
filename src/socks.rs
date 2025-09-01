@@ -8,6 +8,7 @@ use anyhow::bail;
 use socks5_impl::protocol::{self, handshake, password_method, Address, AuthMethod, StreamOperation, UserKey, Version};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
+use tracing::*;
 
 #[derive(Eq, PartialEq, Debug)]
 enum SocksState {
@@ -124,7 +125,7 @@ impl SocksProxyImpl {
         let response = handshake::Response::retrieve_from_stream(&mut self.server_inbuf.clone());
         if let Err(e) = response {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                log::trace!("receive_server_hello_socks5 needs more data \"{}\"...", e);
+                trace!("receive_server_hello_socks5 needs more data \"{}\"...", e);
                 return Ok(());
             } else {
                 bail!(e)
@@ -169,7 +170,7 @@ impl SocksProxyImpl {
         let response = Response::retrieve_from_stream(&mut self.server_inbuf.clone());
         if let Err(e) = response {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                log::trace!("receive_auth_data needs more data \"{}\"...", e);
+                trace!("receive_auth_data needs more data \"{}\"...", e);
                 return Ok(());
             } else {
                 bail!(e)
@@ -199,7 +200,7 @@ impl SocksProxyImpl {
         let response = protocol::Response::retrieve_from_stream(&mut self.server_inbuf.clone());
         if let Err(e) = response {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                log::trace!("receive_connection_status needs more data \"{}\"...", e);
+                trace!("receive_connection_status needs more data \"{}\"...", e);
                 return Ok(());
             } else {
                 bail!(e)
@@ -212,7 +213,7 @@ impl SocksProxyImpl {
         }
         if self.command == protocol::Command::UdpAssociate {
             self.udp_associate = Some(SocketAddr::try_from(&response.address)?);
-            // log::trace!("UDP associate recieved address {}", response.address);
+            // trace!("UDP associate recieved address {}", response.address);
         }
 
         self.state = SocksState::Established;
