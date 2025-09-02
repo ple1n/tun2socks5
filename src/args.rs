@@ -26,10 +26,11 @@ pub struct Args {
 }
 
 #[derive(Subcommand, Serialize, Deserialize, Clone, Debug)]
+#[command(name = "proxy", about = "config for tun2socks")]
 pub enum ArgMode {
-    /// Specify config by a file
+    /// Specify proxy config by a file
     File { path: PathBuf },
-    /// Specify config by cmd args
+    /// Specify proxy config by cmd args
     Args(#[command(flatten)] IArgs),
 }
 
@@ -61,7 +62,7 @@ pub struct IArgs {
     /// for self identifying. EdgeIndex
     #[arg(long)]
     pub id: Option<usize>,
-    /// for self identifying. 
+    /// for self identifying.
     /// also used as default name when creating a new node
     #[arg(long)]
     pub name: Option<String>,
