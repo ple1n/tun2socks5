@@ -7,6 +7,7 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
 };
+use tracing::info;
 
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 #[command(author, version, about = "tun2socks5 application.", long_about = None)]
@@ -32,6 +33,24 @@ pub enum ArgMode {
     File { path: PathBuf },
     /// Specify proxy config by cmd args
     Args(#[command(flatten)] IArgs),
+}
+
+impl ArgMode {
+    pub fn to_iargs(self) -> Result<IArgs> {
+        let args = self;
+        let iargs: IArgs = match args {
+            ArgMode::File { path } => {
+                info!("Reading from {:?}", &path);
+                let mut f = std::fs::File::open(path)?;
+                let iargs: IArgs = serde_json::from_reader(&mut f)?;
+                // Be aware of conflicts
+                info!("State file is {:?}", iargs.state);
+                iargs
+            }
+            ArgMode::Args(args) => args,
+        };
+        Ok(iargs)
+    }
 }
 
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]

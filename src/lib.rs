@@ -67,8 +67,9 @@ const DNS_PORT: u16 = 53;
 static TASK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::atomic::Ordering::Relaxed;
 
-pub macro aok($t:ty) {
-    anyhow::Result::<$t, anyhow::Error>::Ok(())
+pub macro aok {
+  ($t:ty) => {  anyhow::Result::<$t, anyhow::Error>::Ok(())},
+  () => { anyhow::Result::<(), anyhow::Error>::Ok(())}
 }
 
 const POOL_SIZE: usize = 40000;
@@ -78,9 +79,6 @@ pub async fn main_entry(
     mtu: u16,
     packet_info: bool,
     args: IArgs,
-    mut quit: Receiver<()>,
-    quit_sx: Sender<()>,
-    report: Option<Sender<FromClient>>,
 ) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
     let server_addr = args.proxy.addr;
@@ -119,23 +117,13 @@ pub async fn main_entry(
         ..Default::default()
     };
     let vh = vdns.handle.clone();
-    tokio::spawn(async move {
-        tokio::signal::unix::signal(SignalKind::terminate())?.recv().await;
-        warn!("SIGTERM received. Dump state");
-        quit_sx.send(()).await.map_err(|_| anyhow!("send fail"))?;
-        Result::<_>::Ok(())
-    });
 
     use nsproxy_common::rpc::*;
 
     let mut ip_stack = ipstack::IpStack::new(conf, device);
     loop {
         debug!("Wait for new stream");
-        let ip_stack_stream = tokio::select! {
-            k = ip_stack.accept() => k,
-            _ = quit.recv() => break,
-        }?;
-
+        let ip_stack_stream = ip_stack.accept().await?;
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {
                 // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
@@ -205,7 +193,6 @@ pub async fn main_entry(
                     tokio::spawn(async move {
                         if let Err(err) = handle_udp_associate_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
                             error!("{} error \"{:?}\"", info, err);
-                            println!("{}", err);
                         }
                         // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                     });
