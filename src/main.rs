@@ -73,7 +73,7 @@ async fn main_fn() -> anyhow::Result<()> {
     })
     .await;
 
-    if let Err(err) = main_entry(device, MTU, true, iargs, rx, tx, None).await {
+    if let Err(err) = main_entry(device, MTU, true, iargs).await {
         trace!("main_entry error {}", err);
     }
 
