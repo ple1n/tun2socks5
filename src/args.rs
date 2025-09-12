@@ -63,7 +63,7 @@ pub struct IArgs {
     pub ipv6_enabled: bool,
 
     /// DNS handling strategy
-    #[arg(short, long, value_name = "strategy", value_enum, default_value = "handled")]
+    #[arg(long, value_name = "strategy", value_enum, default_value = "handled")]
     pub dns: ArgDns,
 
     /// DNS resolver address
