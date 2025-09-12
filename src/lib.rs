@@ -112,7 +112,7 @@ pub async fn main_entry(
     let conf = IpStackConfig {
         mtu,
         packet_info,
-        tcp_timeout: Duration::from_secs(20),
+        tcp_timeout: Duration::from_secs(60),
         udp_timeout: Duration::from_secs(20),
         ..Default::default()
     };
@@ -218,6 +218,7 @@ async fn handle_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
 ) -> crate::Result<()> {
     let mut server = TcpStream::connect(server_addr).await?;
+    info!("connected proxy at {} for {}", &server_addr, &tcp_stack);
     // let session_info = proxy_handler.lock().await.get_session_info();
     // debug!("beginning {}", session_info);
 
