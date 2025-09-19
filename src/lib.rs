@@ -23,7 +23,7 @@ use std::{
     fmt::Debug,
     future::Future,
     io::Write,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::{DerefMut, RangeInclusive},
     process::exit,
     sync::Arc,
@@ -101,7 +101,8 @@ pub async fn main_entry(
         let mut buf = String::new();
         f.read_to_string(&mut buf).await?;
         let desig: bimap::BiHashMap<Ipv4Addr, String> = serde_json::from_str(&buf)?;
-        vdns.designated = desig;
+
+        todo!()
     }
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr = match args.proxy.proxy_type {
@@ -121,6 +122,8 @@ pub async fn main_entry(
     use nsproxy_common::rpc::*;
 
     let mut ip_stack = ipstack::IpStack::new(conf, device);
+    info!("VirtDNS with assigned mapping: {:?}", &vdns.handle.desig);
+    
     loop {
         debug!("Wait for new stream");
         let ip_stack_stream = ip_stack.accept().await?;

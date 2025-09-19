@@ -4,7 +4,6 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use tracing::{info, trace, warn};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::{Deserialize, Serialize};
@@ -21,6 +20,7 @@ use std::time::{Duration, Instant};
 use std::{net::IpAddr, str::FromStr};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing::{info, trace, warn};
 use trust_dns_proto::op::MessageType;
 use trust_dns_proto::{
     op::{Message, ResponseCode},
@@ -101,7 +101,7 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
 
 use crate::error::Result;
 
-use bimap::BiMap;
+use bimap::{BiHashMap, BiMap};
 use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A};
 use id_alloc::{Ipv4Network, NetRange};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -120,8 +120,6 @@ pub enum VDNSRES {
 }
 
 pub struct VirtDNSAsync {
-    /// User designated name mappings
-    pub designated: BiMap<Ipv4Addr, String>,
     pub subnet: Ipv4Network,
     pub range: RangeInclusive<Ipv4A>,
     pub handle: VirtDNSHandle,
@@ -132,6 +130,7 @@ type EvictedQ = Arc<SegQueue<Ipv4A>>;
 
 #[derive(Clone)]
 pub struct VirtDNSHandle {
+    pub desig: Arc<BiHashMap<Ipv4Addr, String>>,
     f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
     f_domain: Arc<Cache<String, PoolEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
@@ -179,11 +178,13 @@ impl VirtDNSAsync {
         let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
         let range = subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
+        let mut desig = BiHashMap::new();
+        desig.insert("100.120.0.1".parse()?, "veth.host.".to_owned());
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
         Ok(Self {
-            designated: Default::default(),
             range: range.clone(),
             handle: VirtDNSHandle {
+                desig: Arc::new(desig),
                 f_domain: Arc::new(Cache::with(
                     LRU,
                     LRU as u64,
@@ -211,10 +212,10 @@ impl VirtDNSAsync {
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
         Ok(Self {
-            designated: Default::default(),
             range: range.clone(),
             subnet: sta.subnet,
             handle: VirtDNSHandle {
+                desig: Arc::new(Default::default()),
                 f_domain: Arc::new(Cache::with(
                     LRU,
                     LRU as u64,
@@ -256,7 +257,9 @@ impl VirtDNSHandle {
         trace!("virtdns: alloc {}", dom);
         self.apply_evictions();
         IP_HITS.fetch_add(1, Ordering::SeqCst);
-        if let Some(hit) = self.f_domain.get(&dom) {
+        if let Some(desig) = self.desig.get_by_right(&dom) {
+            Ok(desig.to_owned())
+        } else if let Some(hit) = self.f_domain.get(&dom) {
             let addr = hit.addr;
             Ok(addr)
         } else {
