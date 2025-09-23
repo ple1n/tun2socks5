@@ -32,7 +32,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     signal::unix::SignalKind,
     sync::{
@@ -144,13 +144,13 @@ pub async fn main_entry(
                     tokio::spawn(async move {
                         let vdrs = vh.process(tcp.peer_addr());
                         let mut to_proxy = None;
-                        match vdrs {
+                        match &vdrs {
                             VDNSRES::ERR => {
                                 warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
                             }
                             VDNSRES::Addr(dst) => {
                                 to_proxy = match dst {
-                                    TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host, tcp.peer_addr().port())),
+                                    TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
                                     _ => None,
                                 };
                             }
@@ -165,20 +165,23 @@ pub async fn main_entry(
                                 // An error in TCP is handled by state transition internally.
                                 error!("Error that causes drop. {} {:?}", info, err);
                             }
+                        } else {
+                            match vdrs {
+                                VDNSRES::Addr(dst) => match dst {
+                                    TUNResponse::NAT(sock) => {
+                                        if let Err(err) = handle_tcp_nat(tcp, server_addr).await {
+                                            info!("tcp drop {}", server_addr);
+                                        }
+                                    }
+                                    TUNResponse::Files(root) => {
+                                        info!("serve files at {:?}", root)
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            }
                         }
 
-                        match vdrs {
-                            VDNSRES::Addr(dst) => match dst {
-                                TUNResponse::NAT(sock) => {
-                                    if let Err(err) = handle_tcp_nat(tcp, server_addr).await {
-                                        info!("tcp drop {}", tcp);
-                                    }
-                                }
-                                TUNResponse::Files(root) => {}
-                                _ => {}
-                            },
-                            _ => {}
-                        }
                         anyhow::Ok(())
                         // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                     });
@@ -186,12 +189,14 @@ pub async fn main_entry(
                 IpStackStream::Udp(mut udp) => {
                     // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
                     let resolv = vh.process(udp.peer_addr());
-                    let to_proxy = match resolv {
+                    let to_proxy = match &resolv {
                         VDNSRES::Proxied => Some(Address::SocketAddress(udp.peer_addr())),
-                        VDNSRES::Addr(TUNResponse::ProxiedHost(host)) => Some(Address::DomainAddress(host, udp.peer_addr().port())),
+                        VDNSRES::Addr(TUNResponse::ProxiedHost(host)) => {
+                            Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
+                        }
                         _ => None,
                     };
-
+                    let peeraddr = udp.peer_addr();
                     if let Some(dst) = to_proxy {
                         let port = dst.port();
                         let info = SessionInfo::new(udp.local_addr(), dst, IpProtocol::Udp);
@@ -237,7 +242,15 @@ pub async fn main_entry(
                             // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                         });
                     } else {
-                        warn!("Invalid VirtDNS Addr {}", udp.peer_addr());
+                        match resolv {
+                            VDNSRES::Addr(TUNResponse::NAT(host)) => {
+                                handle_udp_nat(udp, host).await?;
+                            }
+                            VDNSRES::Addr(TUNResponse::Files(root)) => {}
+                            _ => {
+                                warn!("Invalid VirtDNS Addr {}", peeraddr);
+                            }
+                        }
                     }
                 }
             }
@@ -393,6 +406,13 @@ async fn handle_udp_associate_session(
             }
         }
     }
+
+    Ok(())
+}
+
+async fn handle_udp_nat(mut udp_stack: IpStackUdpStream, server_addr: SocketAddr) -> crate::Result<()> {
+    let mut udp_server = UdpStream::connect(server_addr).await?;
+    copy_bidirectional(&mut udp_server, &mut udp_stack).await?;
 
     Ok(())
 }
