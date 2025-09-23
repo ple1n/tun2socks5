@@ -43,8 +43,6 @@ impl ArgMode {
                 info!("Reading from {:?}", &path);
                 let mut f = std::fs::File::open(path)?;
                 let iargs: IArgs = serde_json::from_reader(&mut f)?;
-                // Be aware of conflicts
-                info!("State file is {:?}", iargs.state);
                 iargs
             }
             ArgMode::Args(args) => args,
@@ -57,7 +55,7 @@ impl ArgMode {
 pub struct IArgs {
     /// Proxy URL in the form proto://[username[:password]@]host:port
     #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL")]
-    pub proxy: ArgProxy,
+    pub proxy: Option<ArgProxy>,
     /// IPv6 enabled
     #[arg(short = '6', long)]
     pub ipv6_enabled: bool,
@@ -73,8 +71,6 @@ pub struct IArgs {
     /// IPs used in routing setup which should bypass the tunnel
     #[arg(short, long, value_name = "IP")]
     pub bypass: Vec<IpAddr>,
-
-    pub state: Option<PathBuf>,
 
     #[arg(long)]
     pub designated: Option<PathBuf>,

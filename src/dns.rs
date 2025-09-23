@@ -100,6 +100,7 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
 }
 
 use crate::error::Result;
+use crate::POOL_SIZE;
 
 use bimap::{BiHashMap, BiMap};
 use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A};
@@ -129,13 +130,12 @@ type PoolEntry = Arc<PoolEntryT>;
 type EvictedQ = Arc<SegQueue<Ipv4A>>;
 
 pub struct PoolEntryT {
-    lock: RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>,
-    pinned: bool,
+    pub lock: RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>,
+    pub pinned: bool,
 }
 
 #[derive(Clone)]
 pub struct VirtDNSHandle {
-    pub desig: Arc<BiHashMap<Ipv4Addr, String>>,
     f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
     f_domain: Arc<Cache<String, PoolEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
@@ -180,18 +180,21 @@ const LRU_IP_HITS: AtomicUsize = AtomicUsize::new(0);
 const DOMAIN_HITS: AtomicUsize = AtomicUsize::new(0);
 const IP_HITS: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn init_virtdns() {
+    let virt = VirtDNSAsync::default(POOL_SIZE);
+}
+
 impl VirtDNSAsync {
-    pub fn default(cap: usize) -> Result<Self> {
+    pub fn default(host_cap: usize) -> Result<Self> {
         let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
+        assert!(host_cap < subnet.size() as usize);
         let range = subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
-        let mut desig = BiHashMap::new();
-        desig.insert("100.120.0.1".parse()?, "veth.host.".to_owned());
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
-        Ok(Self {
+        let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
-                desig: Arc::new(desig),
                 f_domain: Arc::new(Cache::with(
                     LRU,
                     LRU as u64,
@@ -206,49 +209,14 @@ impl VirtDNSAsync {
                         addr: subnet.ip(),
                         host: 16,
                     },
-                    cap,
+                    host_cap as usize,
                 ),
                 range,
             },
             subnet,
-        })
-    }
-    pub fn from_state(cap: usize, sta: DNSState<String, Ipv4Addr>) -> Result<Self> {
-        info!("Resume DNS state. {} records", sta.map.len());
-        let range = sta.subnet.range(0);
-        let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
-        let ev: Arc<SegQueue<Ipv4A>> = Default::default();
-
-        Ok(Self {
-            range: range.clone(),
-            subnet: sta.subnet,
-            handle: VirtDNSHandle {
-                desig: Arc::new(Default::default()),
-                f_domain: Arc::new(Cache::with(
-                    LRU,
-                    LRU as u64,
-                    UnitWeighter,
-                    DefaultHashBuilder::default(),
-                    IPEviction { evicted: ev.clone() },
-                )),
-                f_ip: concmap,
-                evicted: ev,
-                alloc: Alloc::init(
-                    Ipv4A {
-                        addr: sta.subnet.ip(),
-                        host: 16,
-                    },
-                    cap,
-                ),
-                range,
-            },
-        })
-    }
-    pub fn to_state(&self) -> DNSState<String, Ipv4Addr> {
-        DNSState {
-            map: self.handle.f_ip.iter().map(|(ip, dom)| (dom.domain, ip.addr)).collect(),
-            subnet: self.subnet.clone(),
-        }
+        };
+        virt.handle.pin("100.120.0.1".parse()?, "veth.host.".to_owned());
+        Ok(virt)
     }
 }
 
@@ -265,9 +233,7 @@ impl VirtDNSHandle {
         trace!("virtdns: alloc {}", dom);
         self.apply_evictions();
         IP_HITS.fetch_add(1, Ordering::SeqCst);
-        if let Some(desig) = self.desig.get_by_right(&dom) {
-            Ok(desig.to_owned())
-        } else if let Some(hit) = self.f_domain.get(&dom) {
+        if let Some(hit) = self.f_domain.get(&dom) {
             let k = self.f_domain.get(&dom);
             let addr = hit.lock.addr;
             Ok(addr)
@@ -331,5 +297,29 @@ impl VirtDNSHandle {
             }
             k => VDNSRES::Addr(k.into()),
         }
+    }
+    pub fn ipv4a(&self, ip: Ipv4Addr) -> Ipv4A {
+        Ipv4A::new(ip, self.alloc.interval.host)
+    }
+    pub fn pin(&self, v4: Ipv4Addr, dom: String) -> Result<()> {
+        self.apply_evictions();
+        let own = Arc::new(PoolEntryT {
+            lock: self.alloc.pool.clone().get_rc(),
+            pinned: true,
+        });
+        let addr = own.lock.addr;
+        self.f_ip.insert(
+            *own.lock,
+            IPKeyEntry {
+                domain: dom.clone(),
+                lifetime: own.clone(),
+            },
+        );
+        self.f_domain.insert(dom, own);
+
+        Ok(())
+    }
+    pub fn unpin(&self, dom: String) {
+        todo!()
     }
 }

@@ -27,7 +27,6 @@ async fn main_fn() -> anyhow::Result<()> {
             let mut f = std::fs::File::open(path)?;
             let iargs: IArgs = serde_json::from_reader(&mut f)?;
             // Be aware of conflicts
-            info!("State file is {:?}", iargs.state);
             iargs
         }
         ArgMode::Args(args) => args,
