@@ -81,13 +81,7 @@ const POOL_SIZE: usize = 65535;
 
 pub struct VirtDNSChange {
     pub domain: String,
-    pub target: DNSTarget,
-}
-
-pub enum DNSTarget {
-    IP(Ipv4Addr),
-    Path(PathBuf),
-    Remove,
+    pub target: TUNResponse,
 }
 
 pub async fn main_entry(
