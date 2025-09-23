@@ -125,8 +125,13 @@ pub struct VirtDNSAsync {
     pub handle: VirtDNSHandle,
 }
 
-type PoolEntry = Arc<RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>>;
+type PoolEntry = Arc<PoolEntryT>;
 type EvictedQ = Arc<SegQueue<Ipv4A>>;
+
+pub struct PoolEntryT {
+    lock: RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>,
+    pinned: bool,
+}
 
 #[derive(Clone)]
 pub struct VirtDNSHandle {
@@ -146,11 +151,13 @@ struct IPEviction {
 
 impl Lifecycle<String, PoolEntry> for IPEviction {
     type RequestState = ();
-
+    fn is_pinned(&self, key: &String, val: &PoolEntry) -> bool {
+        val.pinned
+    }
     fn begin_request(&self) -> Self::RequestState {}
     fn on_evict(&self, state: &mut Self::RequestState, key: String, val: PoolEntry) {
-        info!("Evict {} -> {:?}", key, val);
-        self.evicted.push(**val);
+        info!("evict {} -> {:?}", key, val.lock);
+        self.evicted.push(*val.lock);
     }
 }
 
@@ -211,6 +218,7 @@ impl VirtDNSAsync {
         let range = sta.subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
+
         Ok(Self {
             range: range.clone(),
             subnet: sta.subnet,
@@ -260,14 +268,18 @@ impl VirtDNSHandle {
         if let Some(desig) = self.desig.get_by_right(&dom) {
             Ok(desig.to_owned())
         } else if let Some(hit) = self.f_domain.get(&dom) {
-            let addr = hit.addr;
+            let k = self.f_domain.get(&dom);
+            let addr = hit.lock.addr;
             Ok(addr)
         } else {
-            let own = Arc::new(self.alloc.pool.clone().get_rc());
+            let own = Arc::new(PoolEntryT {
+                lock: self.alloc.pool.clone().get_rc(),
+                pinned: false,
+            });
             trace!("got object from pool");
-            let addr = own.addr;
+            let addr = own.lock.addr;
             self.f_ip.insert(
-                **own,
+                *own.lock,
                 IPKeyEntry {
                     domain: dom.clone(),
                     lifetime: own.clone(),
