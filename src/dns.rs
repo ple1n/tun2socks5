@@ -137,10 +137,25 @@ pub struct PoolEntryT {
 #[derive(Clone)]
 pub struct VirtDNSHandle {
     f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
-    f_domain: Arc<Cache<String, PoolEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
+    f_domain: Arc<Cache<String, DomainEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
     range: RangeInclusive<Ipv4A>,
     evicted: EvictedQ,
+}
+
+#[derive(Clone)]
+pub enum DomainEntry {
+    Pool(PoolEntry),
+    Pinned(Ipv4A),
+}
+
+impl DomainEntry {
+    pub fn addr(&self) -> Ipv4Addr {
+        match self {
+            DomainEntry::Pinned(val) => val.addr,
+            DomainEntry::Pool(val) => val.lock.addr.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -149,15 +164,23 @@ struct IPEviction {
     evicted: EvictedQ,
 }
 
-impl Lifecycle<String, PoolEntry> for IPEviction {
+impl Lifecycle<String, DomainEntry> for IPEviction {
     type RequestState = ();
-    fn is_pinned(&self, key: &String, val: &PoolEntry) -> bool {
-        val.pinned
+    fn is_pinned(&self, key: &String, val: &DomainEntry) -> bool {
+        match val {
+            DomainEntry::Pinned(_) => true,
+            DomainEntry::Pool(p) => p.pinned,
+        }
     }
     fn begin_request(&self) -> Self::RequestState {}
-    fn on_evict(&self, state: &mut Self::RequestState, key: String, val: PoolEntry) {
-        info!("evict {} -> {:?}", key, val.lock);
-        self.evicted.push(*val.lock);
+    fn on_evict(&self, state: &mut Self::RequestState, key: String, val: DomainEntry) {
+        match val {
+            DomainEntry::Pinned(_) => unreachable!(),
+            DomainEntry::Pool(val) => {
+                info!("evict {} -> {:?}", key, val.lock);
+                self.evicted.push(*val.lock);
+            }
+        }
     }
 }
 
@@ -170,7 +193,7 @@ impl Lifecycle<String, PoolEntry> for IPEviction {
 #[derive(Clone)]
 struct IPKeyEntry {
     domain: String,
-    lifetime: PoolEntry,
+    lifetime: Option<PoolEntry>,
 }
 
 const LRU: usize = 4096;
@@ -235,7 +258,7 @@ impl VirtDNSHandle {
         IP_HITS.fetch_add(1, Ordering::SeqCst);
         if let Some(hit) = self.f_domain.get(&dom) {
             let k = self.f_domain.get(&dom);
-            let addr = hit.lock.addr;
+            let addr = hit.addr();
             Ok(addr)
         } else {
             let own = Arc::new(PoolEntryT {
@@ -248,10 +271,10 @@ impl VirtDNSHandle {
                 *own.lock,
                 IPKeyEntry {
                     domain: dom.clone(),
-                    lifetime: own.clone(),
+                    lifetime: own.clone().into(),
                 },
             );
-            self.f_domain.insert(dom, own);
+            self.f_domain.insert(dom, DomainEntry::Pool(own));
             Ok(addr)
         }
     }
@@ -303,19 +326,20 @@ impl VirtDNSHandle {
     }
     pub fn pin(&self, v4: Ipv4Addr, dom: String) -> Result<()> {
         self.apply_evictions();
-        let own = Arc::new(PoolEntryT {
-            lock: self.alloc.pool.clone().get_rc(),
-            pinned: true,
-        });
-        let addr = own.lock.addr;
-        self.f_ip.insert(
-            *own.lock,
-            IPKeyEntry {
-                domain: dom.clone(),
-                lifetime: own.clone(),
-            },
-        );
-        self.f_domain.insert(dom, own);
+
+        if self.range.contains(&self.ipv4a(v4)) {
+            warn!("manually assigned IP should not fall into Virt DNS exclusive subnet");
+            bail!("invalid IP designation");
+        } else {
+            self.f_ip.insert(
+                self.ipv4a(v4),
+                IPKeyEntry {
+                    domain: dom.clone(),
+                    lifetime: None,
+                },
+            );
+            self.f_domain.insert(dom, DomainEntry::Pinned(self.ipv4a(v4)));
+        }
 
         Ok(())
     }
