@@ -3,13 +3,13 @@
 
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    dns::{DNSState, VDNSRES},
+    dns::{DNSState, TUNResponse, VDNSRES},
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
-use futures::{future::pending, SinkExt, StreamExt};
+use futures::{channel::mpsc, future::pending, SinkExt, StreamExt};
 use id_alloc::NetRange;
 use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
@@ -18,6 +18,7 @@ use ipstack::{
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
+use socks5_impl::protocol::Address;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
@@ -25,6 +26,7 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::{DerefMut, RangeInclusive},
+    path::PathBuf,
     process::exit,
     sync::Arc,
     time::Duration,
@@ -77,7 +79,24 @@ pub macro aok {
 /// Otherwise, fork opool and use SeqQueue which is unbounded.
 const POOL_SIZE: usize = 65535;
 
-pub async fn main_entry(device: TUNDev, mtu: u16, packet_info: bool, args: IArgs) -> crate::Result<()> {
+pub struct VirtDNSChange {
+    pub domain: String,
+    pub target: DNSTarget,
+}
+
+pub enum DNSTarget {
+    IP(Ipv4Addr),
+    Path(PathBuf),
+    Remove,
+}
+
+pub async fn main_entry(
+    device: TUNDev,
+    mtu: u16,
+    packet_info: bool,
+    args: IArgs,
+    rx: mpsc::UnboundedReceiver<VirtDNSChange>,
+) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
     if let Some(argproxy) = args.proxy {
         let server_addr = argproxy.addr;
@@ -123,7 +142,22 @@ pub async fn main_entry(device: TUNDev, mtu: u16, packet_info: bool, args: IArgs
                     let mgr = mgr.clone();
                     let vh = vh.clone();
                     tokio::spawn(async move {
-                        if let VDNSRES::Addr(dst) = vh.process(tcp.peer_addr()) {
+                        let vdrs = vh.process(tcp.peer_addr());
+                        let mut to_proxy = None;
+                        match vdrs {
+                            VDNSRES::ERR => {
+                                warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
+                            }
+                            VDNSRES::Addr(dst) => {
+                                to_proxy = match dst {
+                                    TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host, tcp.peer_addr().port())),
+                                    _ => None,
+                                };
+                            }
+                            VDNSRES::Proxied => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
+                        }
+
+                        if let Some(dst) = to_proxy {
                             let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
                             let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                             if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
@@ -131,8 +165,19 @@ pub async fn main_entry(device: TUNDev, mtu: u16, packet_info: bool, args: IArgs
                                 // An error in TCP is handled by state transition internally.
                                 error!("Error that causes drop. {} {:?}", info, err);
                             }
-                        } else {
-                            warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
+                        }
+
+                        match vdrs {
+                            VDNSRES::Addr(dst) => match dst {
+                                TUNResponse::NAT(sock) => {
+                                    if let Err(err) = handle_tcp_nat(tcp, server_addr).await {
+                                        info!("tcp drop {}", tcp);
+                                    }
+                                }
+                                TUNResponse::Files(root) => {}
+                                _ => {}
+                            },
+                            _ => {}
                         }
                         anyhow::Ok(())
                         // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
@@ -140,13 +185,15 @@ pub async fn main_entry(device: TUNDev, mtu: u16, packet_info: bool, args: IArgs
                 }
                 IpStackStream::Udp(mut udp) => {
                     // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                    if let VDNSRES::Addr(dst) = vh.process(udp.peer_addr()) {
+                    let resolv = vh.process(udp.peer_addr());
+                    let to_proxy = match resolv {
+                        VDNSRES::Proxied => Some(Address::SocketAddress(udp.peer_addr())),
+                        VDNSRES::Addr(TUNResponse::ProxiedHost(host)) => Some(Address::DomainAddress(host, udp.peer_addr().port())),
+                        _ => None,
+                    };
+
+                    if let Some(dst) = to_proxy {
                         let port = dst.port();
-                        // if dst.port() == DNS_PORT {
-                        //     if private_ip::is_private_ip(dst.ip()) {
-                        //         dst.set_ip(dns_addr);
-                        //     }
-                        // }
                         let info = SessionInfo::new(udp.local_addr(), dst, IpProtocol::Udp);
                         if port == DNS_PORT {
                             match args.dns {
@@ -196,6 +243,14 @@ pub async fn main_entry(device: TUNDev, mtu: u16, packet_info: bool, args: IArgs
             }
         }
     }
+
+    Ok(())
+}
+
+async fn handle_tcp_nat(mut tcp_stack: IpStackTcpStream, server_addr: SocketAddr) -> crate::Result<()> {
+    let mut server = TcpStream::connect(server_addr).await?;
+
+    tokio::io::copy_bidirectional(&mut tcp_stack, &mut server).await?;
 
     Ok(())
 }

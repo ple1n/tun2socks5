@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use futures::channel::mpsc::unbounded;
 use ipstack::TUNDev;
 use tracing::info;
 use tracing::trace;
@@ -72,7 +73,8 @@ async fn main_fn() -> anyhow::Result<()> {
     })
     .await;
 
-    if let Err(err) = main_entry(device, MTU, true, iargs).await {
+    let (tunsx, tunrx) = unbounded();
+    if let Err(err) = main_entry(device, MTU, true, iargs, tunrx).await {
         trace!("main_entry error {}", err);
     }
 

@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::{Hash, RandomState};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -116,7 +117,8 @@ pub struct DNSState<R: Hash + Eq, L: Hash + Eq> {
 
 #[derive(Debug)]
 pub enum VDNSRES {
-    Addr(Address),
+    Addr(TUNResponse),
+    Proxied,
     ERR,
 }
 
@@ -192,8 +194,15 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
 
 #[derive(Clone)]
 struct IPKeyEntry {
-    domain: String,
+    domain: TUNResponse,
     lifetime: Option<PoolEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TUNResponse {
+    ProxiedHost(String),
+    NAT(SocketAddr),
+    Files(PathBuf),
 }
 
 const LRU: usize = 4096;
@@ -252,7 +261,7 @@ impl VirtDNSHandle {
         //     }
         // });
     }
-    pub fn alloc(&self, dom: String) -> Result<Ipv4Addr> {
+    pub fn to_respond_in_dns(&self, dom: String) -> Result<Ipv4Addr> {
         trace!("virtdns: alloc {}", dom);
         self.apply_evictions();
         IP_HITS.fetch_add(1, Ordering::SeqCst);
@@ -270,7 +279,7 @@ impl VirtDNSHandle {
             self.f_ip.insert(
                 *own.lock,
                 IPKeyEntry {
-                    domain: dom.clone(),
+                    domain: TUNResponse::ProxiedHost(dom.clone()),
                     lifetime: own.clone().into(),
                 },
             );
@@ -291,7 +300,7 @@ impl VirtDNSHandle {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
         info!("VirtDNS recved {}", qname);
-        let ip = self.alloc(qname.clone())?;
+        let ip = self.to_respond_in_dns(qname.clone())?;
         let message = build_dns_response(message, &qname, ip.into(), 5)?;
         Ok(message.to_vec()?)
     }
@@ -307,18 +316,16 @@ impl VirtDNSHandle {
 
                     if let Some(IPKeyEntry { domain, lifetime }) = self.f_ip.get(&v4a) {
                         dns_hit();
-                        VDNSRES::Addr(Address::DomainAddress(domain, v4.port()))
+                        VDNSRES::Addr(domain)
                     } else {
                         warn!("virtdns: address with no associated domain, {}", &v4);
                         VDNSRES::ERR
                     }
-
-                    // Reset
                 } else {
-                    VDNSRES::Addr(Address::SocketAddress(v4.into()))
+                    VDNSRES::Proxied
                 }
             }
-            k => VDNSRES::Addr(k.into()),
+            k => VDNSRES::Proxied,
         }
     }
     pub fn ipv4a(&self, ip: Ipv4Addr) -> Ipv4A {
@@ -334,7 +341,7 @@ impl VirtDNSHandle {
             self.f_ip.insert(
                 self.ipv4a(v4),
                 IPKeyEntry {
-                    domain: dom.clone(),
+                    domain: TUNResponse::ProxiedHost(dom.clone()),
                     lifetime: None,
                 },
             );
