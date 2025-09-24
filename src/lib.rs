@@ -3,13 +3,17 @@
 
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    dns::{DNSState, TUNResponse, VDNSRES, VirtDNSHandle},
+    dns::{DNSState, TUNResponse, VirtDNSHandle, VDNSRES},
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt, channel::{mpsc, oneshot}, future::pending};
+use futures::{
+    channel::{mpsc, oneshot},
+    future::pending,
+    SinkExt, StreamExt,
+};
 use id_alloc::NetRange;
 use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
@@ -32,12 +36,11 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional},
+    net::{TcpSocket, TcpStream},
     signal::unix::SignalKind,
     sync::{
-        mpsc::{Receiver, Sender},
-        Mutex, RwLock,
+        Mutex, RwLock, mpsc::{Receiver, Sender}
     },
     time::Instant,
 };
@@ -89,7 +92,7 @@ pub async fn main_entry(
     mtu: u16,
     packet_info: bool,
     args: IArgs,
-    dns_sx: oneshot::Sender<VirtDNSHandle>
+    dns_sx: oneshot::Sender<VirtDNSHandle>,
 ) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
     if let Some(argproxy) = args.proxy {
@@ -163,9 +166,9 @@ pub async fn main_entry(
                         } else {
                             match vdrs {
                                 VDNSRES::SpecialHandling(dst) => match dst {
-                                    TUNResponse::NAT(sock) => {
-                                        if let Err(err) = handle_tcp_nat(tcp, server_addr).await {
-                                            info!("tcp drop {}", server_addr);
+                                    TUNResponse::NATByTUN(sock) => {
+                                        if let Err(err) = handle_tcp_nat(tcp, sock).await {
+                                            info!("tcp drop {} {}", sock, err);
                                         }
                                     }
                                     TUNResponse::Files(root) => {
@@ -240,7 +243,7 @@ pub async fn main_entry(
                         });
                     } else {
                         match resolv {
-                            VDNSRES::SpecialHandling(TUNResponse::NAT(host)) => {
+                            VDNSRES::SpecialHandling(TUNResponse::NATByTUN(host)) => {
                                 handle_udp_nat(udp, host).await?;
                             }
                             VDNSRES::SpecialHandling(TUNResponse::Files(root)) => {}
@@ -258,6 +261,7 @@ pub async fn main_entry(
 }
 
 async fn handle_tcp_nat(mut tcp_stack: IpStackTcpStream, server_addr: SocketAddr) -> crate::Result<()> {
+    info!("NAT {} (app) connect {} (remote)", tcp_stack.local_addr(), &server_addr);
     let mut server = TcpStream::connect(server_addr).await?;
 
     tokio::io::copy_bidirectional(&mut tcp_stack, &mut server).await?;

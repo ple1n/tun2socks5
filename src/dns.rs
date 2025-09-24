@@ -180,7 +180,9 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
     fn begin_request(&self) -> Self::RequestState {}
     fn on_evict(&self, state: &mut Self::RequestState, key: String, val: DomainEntry) {
         match val {
-            DomainEntry::Pinned(_) => unreachable!(),
+            DomainEntry::Pinned(ip) => {
+                warn!("evicting pinned {}", ip.addr);
+            },
             DomainEntry::Pool(val) => {
                 info!("evict {} -> {:?}", key, val.lock);
                 self.evicted.push(*val.lock);
@@ -204,7 +206,8 @@ struct IPKeyEntry {
 #[derive(Clone, Debug)]
 pub enum TUNResponse {
     ProxiedHost(String),
-    NAT(SocketAddr),
+    /// Warning. The connection is made by TUN process, which exists in SRC NS.
+    NATByTUN(SocketAddr),
     Files(PathBuf),
     /// When the user has properly configured routing
     Unreachable,
