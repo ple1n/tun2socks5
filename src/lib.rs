@@ -36,14 +36,16 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional},
+    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpSocket, TcpStream},
     signal::unix::SignalKind,
     sync::{
-        Mutex, RwLock, mpsc::{Receiver, Sender}
+        mpsc::{Receiver, Sender},
+        Mutex, RwLock,
     },
     time::Instant,
 };
+pub use flume;
 use tracing::{debug, error, info, trace, warn};
 use tun_rs::AsyncDevice;
 use udp_stream::UdpStream;
@@ -93,6 +95,7 @@ pub async fn main_entry(
     packet_info: bool,
     args: IArgs,
     dns_sx: oneshot::Sender<VirtDNSHandle>,
+    st_sx: flume::Sender<(PathBuf, IpStackTcpStream)>,
 ) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
     if let Some(argproxy) = args.proxy {
@@ -134,6 +137,7 @@ pub async fn main_entry(
         loop {
             debug!("Wait for new stream");
             let ip_stack_stream = ip_stack.accept().await?;
+            let stream_sx = st_sx.clone();
             match ip_stack_stream {
                 IpStackStream::Tcp(tcp) => {
                     // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
@@ -172,7 +176,8 @@ pub async fn main_entry(
                                         }
                                     }
                                     TUNResponse::Files(root) => {
-                                        info!("serve files at {:?}", root)
+                                        info!("serve files at {:?}", root);
+                                        stream_sx.send_async((root, tcp)).await;
                                     }
                                     _ => {
                                         warn!("unexpected traffic, indicating misconfigured routing")
