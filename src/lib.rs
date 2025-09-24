@@ -3,13 +3,13 @@
 
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    dns::{DNSState, TUNResponse, VDNSRES},
+    dns::{DNSState, TUNResponse, VDNSRES, VirtDNSHandle},
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
-use futures::{channel::mpsc, future::pending, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, channel::{mpsc, oneshot}, future::pending};
 use id_alloc::NetRange;
 use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
@@ -89,7 +89,7 @@ pub async fn main_entry(
     mtu: u16,
     packet_info: bool,
     args: IArgs,
-    rx: mpsc::UnboundedReceiver<VirtDNSChange>,
+    dns_sx: oneshot::Sender<VirtDNSHandle>
 ) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
     if let Some(argproxy) = args.proxy {
@@ -122,6 +122,7 @@ pub async fn main_entry(
             ..Default::default()
         };
         let vh = vdns.handle.clone();
+        dns_sx.send(vh.clone());
 
         use nsproxy_common::rpc::*;
 
@@ -142,13 +143,13 @@ pub async fn main_entry(
                             VDNSRES::ERR => {
                                 warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
                             }
-                            VDNSRES::Addr(dst) => {
+                            VDNSRES::SpecialHandling(dst) => {
                                 to_proxy = match dst {
                                     TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
                                     _ => None,
                                 };
                             }
-                            VDNSRES::Proxied => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
+                            VDNSRES::NormalProxying => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
                         }
 
                         if let Some(dst) = to_proxy {
@@ -161,7 +162,7 @@ pub async fn main_entry(
                             }
                         } else {
                             match vdrs {
-                                VDNSRES::Addr(dst) => match dst {
+                                VDNSRES::SpecialHandling(dst) => match dst {
                                     TUNResponse::NAT(sock) => {
                                         if let Err(err) = handle_tcp_nat(tcp, server_addr).await {
                                             info!("tcp drop {}", server_addr);
@@ -170,7 +171,9 @@ pub async fn main_entry(
                                     TUNResponse::Files(root) => {
                                         info!("serve files at {:?}", root)
                                     }
-                                    _ => {}
+                                    _ => {
+                                        warn!("unexpected traffic, indicating misconfigured routing")
+                                    }
                                 },
                                 _ => {}
                             }
@@ -184,8 +187,8 @@ pub async fn main_entry(
                     // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
                     let resolv = vh.process(udp.peer_addr());
                     let to_proxy = match &resolv {
-                        VDNSRES::Proxied => Some(Address::SocketAddress(udp.peer_addr())),
-                        VDNSRES::Addr(TUNResponse::ProxiedHost(host)) => {
+                        VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
+                        VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
                             Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
                         }
                         _ => None,
@@ -237,10 +240,10 @@ pub async fn main_entry(
                         });
                     } else {
                         match resolv {
-                            VDNSRES::Addr(TUNResponse::NAT(host)) => {
+                            VDNSRES::SpecialHandling(TUNResponse::NAT(host)) => {
                                 handle_udp_nat(udp, host).await?;
                             }
-                            VDNSRES::Addr(TUNResponse::Files(root)) => {}
+                            VDNSRES::SpecialHandling(TUNResponse::Files(root)) => {}
                             _ => {
                                 warn!("Invalid VirtDNS Addr {}", peeraddr);
                             }

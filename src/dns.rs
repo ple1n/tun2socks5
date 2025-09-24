@@ -117,8 +117,8 @@ pub struct DNSState<R: Hash + Eq, L: Hash + Eq> {
 
 #[derive(Debug)]
 pub enum VDNSRES {
-    Addr(TUNResponse),
-    Proxied,
+    SpecialHandling(TUNResponse),
+    NormalProxying,
     ERR,
 }
 
@@ -153,9 +153,12 @@ pub enum DomainEntry {
 
 impl DomainEntry {
     pub fn addr(&self) -> Ipv4Addr {
+        self.addr_a().addr
+    }
+    pub fn addr_a(&self) -> Ipv4A {
         match self {
-            DomainEntry::Pinned(val) => val.addr,
-            DomainEntry::Pool(val) => val.lock.addr.clone(),
+            DomainEntry::Pinned(val) => *val,
+            DomainEntry::Pool(val) => *val.lock,
         }
     }
 }
@@ -203,6 +206,8 @@ pub enum TUNResponse {
     ProxiedHost(String),
     NAT(SocketAddr),
     Files(PathBuf),
+    /// When the user has properly configured routing
+    Unreachable,
 }
 
 const LRU: usize = 4096;
@@ -247,7 +252,8 @@ impl VirtDNSAsync {
             },
             subnet,
         };
-        virt.handle.pin("100.120.0.1".parse()?, "veth.host.".to_owned());
+        virt.handle
+            .pin(Some("100.120.0.1".parse()?), "veth.host.".to_owned(), TUNResponse::Unreachable);
         Ok(virt)
     }
 }
@@ -266,7 +272,6 @@ impl VirtDNSHandle {
         self.apply_evictions();
         IP_HITS.fetch_add(1, Ordering::SeqCst);
         if let Some(hit) = self.f_domain.get(&dom) {
-            let k = self.f_domain.get(&dom);
             let addr = hit.addr();
             Ok(addr)
         } else {
@@ -305,48 +310,69 @@ impl VirtDNSHandle {
         Ok(message.to_vec()?)
     }
     pub fn process(&self, addr: SocketAddr) -> VDNSRES {
-        trace!("virtdns: resolve {}", addr);
         match addr {
             SocketAddr::V4(v4) => {
-                // this takes priority
-                if self.range.contains(&v4.ip().to_owned().into()) {
-                    let dns_hit = || DOMAIN_HITS.fetch_add(1, Ordering::SeqCst);
-                    // Exclusive range for Virt DNS
-                    let v4a = Ipv4A::new(*v4.ip(), self.alloc.interval.host);
-
-                    if let Some(IPKeyEntry { domain, lifetime }) = self.f_ip.get(&v4a) {
-                        dns_hit();
-                        VDNSRES::Addr(domain)
-                    } else {
-                        warn!("virtdns: address with no associated domain, {}", &v4);
-                        VDNSRES::ERR
-                    }
+                let v4a = self.ipv4a(v4.ip().to_owned());
+                let entry = if let Some(IPKeyEntry { domain, lifetime }) = self.f_ip.get(&v4a) {
+                    Some(domain)
                 } else {
-                    VDNSRES::Proxied
+                    None
+                };
+
+                if self.range.contains(&v4.ip().to_owned().into()) {
+                    if !entry.is_some() {
+                        warn!("virtdns: address with no associated domain, {}", &v4);
+                        return VDNSRES::ERR;
+                    }
+                }
+                match entry {
+                    None => VDNSRES::NormalProxying,
+                    Some(h) => VDNSRES::SpecialHandling(h)
                 }
             }
-            k => VDNSRES::Proxied,
+            k => VDNSRES::NormalProxying,
         }
     }
     pub fn ipv4a(&self, ip: Ipv4Addr) -> Ipv4A {
         Ipv4A::new(ip, self.alloc.interval.host)
     }
-    pub fn pin(&self, v4: Ipv4Addr, dom: String) -> Result<()> {
+    pub fn pin(&self, v4: Option<Ipv4Addr>, dom: String, tun: TUNResponse) -> Result<()> {
         self.apply_evictions();
+        // Each data is a row with 3 columns.
+        if let Some(hit) = self.f_domain.get(&dom) {
+            self.f_ip.remove(&hit.addr_a());
+        }
 
-        if self.range.contains(&self.ipv4a(v4)) {
-            warn!("manually assigned IP should not fall into Virt DNS exclusive subnet");
-            bail!("invalid IP designation");
-        } else {
+        if let Some(v4) = v4 {
+            let v4a = self.ipv4a(v4);
+            if self.range.contains(&v4a) {
+                warn!("manually assigned IP should not fall into Virt DNS exclusive subnet");
+                bail!("invalid IP designation");
+            }
             self.f_ip.insert(
-                self.ipv4a(v4),
+                v4a,
                 IPKeyEntry {
-                    domain: TUNResponse::ProxiedHost(dom.clone()),
+                    domain: tun,
                     lifetime: None,
                 },
             );
-            self.f_domain.insert(dom, DomainEntry::Pinned(self.ipv4a(v4)));
-        }
+            self.f_domain.insert(dom, DomainEntry::Pinned(v4a));
+        } else {
+            let own = Arc::new(PoolEntryT {
+                lock: self.alloc.pool.clone().get_rc(),
+                pinned: false,
+            });
+            trace!("got object from pool");
+            let addr = own.lock.addr;
+            self.f_ip.insert(
+                *own.lock,
+                IPKeyEntry {
+                    domain: tun,
+                    lifetime: own.clone().into(),
+                },
+            );
+            self.f_domain.insert(dom, DomainEntry::Pool(own));
+        };
 
         Ok(())
     }
