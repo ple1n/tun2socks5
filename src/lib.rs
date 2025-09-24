@@ -176,8 +176,11 @@ pub async fn main_entry(
                                         }
                                     }
                                     TUNResponse::Files(root) => {
-                                        info!("serve files at {:?}", root);
-                                        stream_sx.send_async((root, tcp)).await;
+                                        info!("tun: serve files at {:?}", root);
+                                        let k = stream_sx.send_async((root, tcp)).await;
+                                        if k.is_err() {
+                                            warn!("{:?}", k);
+                                        }
                                     }
                                     _ => {
                                         warn!("unexpected traffic, indicating misconfigured routing")

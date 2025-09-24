@@ -257,6 +257,8 @@ impl VirtDNSAsync {
         };
         virt.handle
             .pin(Some("100.120.0.1".parse()?), "veth.host.".to_owned(), TUNResponse::Unreachable);
+        virt.handle
+            .pin(Some("100.120.0.2".parse()?), "veth.peer.".to_owned(), TUNResponse::Unreachable);
         Ok(virt)
     }
 }
