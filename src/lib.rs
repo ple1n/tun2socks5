@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
+pub use flume;
 use futures::{
     channel::{mpsc, oneshot},
     future::pending,
@@ -16,8 +17,7 @@ use futures::{
 };
 use id_alloc::NetRange;
 use ipstack::{
-    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream},
-    IpStackConfig, TUNDev,
+    IpStackConfig, TUNDev, stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, tcp::TcpConfig}
 };
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
@@ -45,7 +45,6 @@ use tokio::{
     },
     time::Instant,
 };
-pub use flume;
 use tracing::{debug, error, info, trace, warn};
 use tun_rs::AsyncDevice;
 use udp_stream::UdpStream;
@@ -122,11 +121,11 @@ pub async fn main_entry(
         };
         let conf = IpStackConfig {
             mtu,
-            packet_info,
-            tcp_timeout: Duration::from_secs(60),
+            packet_information: packet_info,
             udp_timeout: Duration::from_secs(20),
-            ..Default::default()
+            tcp_config: Arc::new(TcpConfig::default())
         };
+
         let vh = vdns.handle.clone();
         dns_sx.send(vh.clone());
 
@@ -283,7 +282,6 @@ async fn handle_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
 ) -> crate::Result<()> {
     let mut server = TcpStream::connect(server_addr).await?;
-    info!("connected proxy at {} for {}", &server_addr, &tcp_stack);
     // let session_info = proxy_handler.lock().await.get_session_info();
     // debug!("beginning {}", session_info);
 
