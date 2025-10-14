@@ -80,7 +80,7 @@ pub struct IArgs {
     /// for self identifying.
     /// also used as default name when creating a new node
     #[arg(long)]
-    pub name: Option<String>,
+    pub tun_name: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]
