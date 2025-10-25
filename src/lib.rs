@@ -93,7 +93,7 @@ pub async fn main_entry(
     mtu: u16,
     packet_info: bool,
     args: IArgs,
-    dns_sx: oneshot::Sender<VirtDNSHandle>,
+    mut dns_sx: mpsc::Sender<Option<VirtDNSHandle>>,
     st_sx: flume::Sender<(PathBuf, IpStackTcpStream)>,
 ) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
@@ -127,7 +127,7 @@ pub async fn main_entry(
         };
 
         let vh = vdns.handle.clone();
-        dns_sx.send(vh.clone());
+        dns_sx.send(Some(vh.clone())).await;
 
         use nsproxy_common::rpc::*;
 
