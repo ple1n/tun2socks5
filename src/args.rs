@@ -54,7 +54,7 @@ impl ArgMode {
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 pub struct IArgs {
     /// Proxy URL in the form proto://[username[:password]@]host:port
-    #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL")]
+    #[arg(short, long, value_parser = ArgProxy::from_url, value_name = "URL", required = false)]
     pub proxy: Option<ArgProxy>,
     /// IPv6 enabled
     #[arg(short = '6', long)]
