@@ -105,7 +105,7 @@ use crate::error::Result;
 use crate::POOL_SIZE;
 
 use bimap::{BiHashMap, BiMap};
-use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A, Ipv6Network};
+use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A, Ipv6A, Ipv6Network};
 use id_alloc::{Ipv4Network, NetRange};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::ops::{Deref, RangeInclusive};
@@ -127,7 +127,6 @@ pub struct VirtDNSAsync {
     pub subnet: Ipv4Network,
     pub range: RangeInclusive<Ipv4A>,
     pub handle: VirtDNSHandle,
-    pub subnet6: Ipv6Network,
 }
 
 type PoolEntry = Arc<PoolEntryT>;
@@ -141,10 +140,13 @@ pub struct PoolEntryT {
 #[derive(Clone)]
 pub struct VirtDNSHandle {
     f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
+    ip6: ConcurrentMap<Ipv6A, TUNResponse>,
+    pub subnet6: Ipv6Network,
     f_domain: Arc<Cache<String, DomainEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
     range: RangeInclusive<Ipv4A>,
     evicted: EvictedQ,
+    pub aaaa_only: bool,
 }
 
 #[derive(Clone)]
@@ -225,8 +227,8 @@ const IP_HITS: AtomicUsize = AtomicUsize::new(0);
 #[test]
 fn init_virtdns() {
     let virt = VirtDNSAsync::default(POOL_SIZE).unwrap();
-    dbg!(&virt.subnet6);
-    let net = virt.subnet6;
+    dbg!(&virt.handle.subnet6);
+    let net = virt.handle.subnet6;
     println!("{:b}", net.mask().to_bits());
     println!("{:b}", !net.mask().to_bits());
     let hash = xxhash3_128::Hasher::oneshot("veth.host6.".as_bytes());
@@ -236,7 +238,6 @@ fn init_virtdns() {
     println!("ip {:?}", net);
     let ip = Ipv6Addr::from_bits(net);
     println!("ip {:?}", ip);
-
 }
 
 #[test]
@@ -251,10 +252,14 @@ impl VirtDNSAsync {
         assert!(host_cap < subnet.size() as usize);
         let range = subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
+        let concmap6: ConcurrentMap<_, _> = Default::default();
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
         let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
+                subnet6: "fc00::/7".parse()?,
+                aaaa_only: true,
+
                 f_domain: Arc::new(Cache::with(
                     LRU,
                     LRU as u64,
@@ -272,9 +277,9 @@ impl VirtDNSAsync {
                     host_cap as usize,
                 ),
                 range,
+                ip6: concmap6,
             },
             subnet,
-            subnet6: "fc00::/7".parse()?,
         };
         virt.handle
             .pin(Some("100.120.0.1".parse()?), "veth.host.".to_owned(), TUNResponse::Unreachable);
@@ -282,7 +287,9 @@ impl VirtDNSAsync {
             .pin(Some("100.120.0.2".parse()?), "veth.peer.".to_owned(), TUNResponse::Unreachable);
         Ok(virt)
     }
+}
 
+impl VirtDNSHandle {
     /// Convert a domain name into a deterministic IPv6 address inside `self.subnet6`.
     ///
     /// The algorithm hashes the provided domain string using xxhash3_128, takes
@@ -303,9 +310,14 @@ impl VirtDNSAsync {
 
         Ipv6Addr::from_bits(combined)
     }
-}
 
-impl VirtDNSHandle {
+    pub fn respond_v6(&self, dom: String) -> Result<Ipv6Addr> {
+        let ip = self.domain_to_ipv6(&dom);
+        let ipa = self.ipv6a(ip);
+        self.ip6.insert(ipa, TUNResponse::ProxiedHost(dom));
+        Ok(ip)
+    }
+
     pub async fn periodic_report(self) {
         // tokio::spawn(async move {
         //     loop {
@@ -352,9 +364,15 @@ impl VirtDNSHandle {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
         info!("VirtDNS recved {}", qname);
-        let ip = self.to_respond_in_dns(qname.clone())?;
-        let message = build_dns_response(message, &qname, ip.into(), 5)?;
-        Ok(message.to_vec()?)
+        if self.aaaa_only {
+            let ip = self.respond_v6(qname.clone())?;
+            let message = build_dns_response(message, &qname, ip.into(), 5)?;
+            Ok(message.to_vec()?)
+        } else {
+            let ip = self.to_respond_in_dns(qname.clone())?;
+            let message = build_dns_response(message, &qname, ip.into(), 5)?;
+            Ok(message.to_vec()?)
+        }
     }
     pub fn process(&self, addr: SocketAddr) -> VDNSRES {
         match addr {
@@ -377,11 +395,31 @@ impl VirtDNSHandle {
                     Some(h) => VDNSRES::SpecialHandling(h),
                 }
             }
+            SocketAddr::V6(v6) => {
+                let v6a = self.ipv6a(v6.ip().to_owned());
+                let entry = self.ip6.get(&v6a);
+                match entry {
+                    None => {
+                        if self.subnet6.contains(*v6.ip()) {
+                            warn!("VirtDNSv6, entry not found");
+                            VDNSRES::ERR
+                        } else {
+                            VDNSRES::NormalProxying
+                        }
+                    },
+                    Some(h) => {
+                        VDNSRES::SpecialHandling(h)
+                    }
+                }
+            }
             k => VDNSRES::NormalProxying,
         }
     }
     pub fn ipv4a(&self, ip: Ipv4Addr) -> Ipv4A {
         Ipv4A::new(ip, self.alloc.interval.host)
+    }
+    pub fn ipv6a(&self, ip: Ipv6Addr) -> Ipv6A {
+        Ipv6A::new(ip, 128 - 7)
     }
     pub fn pin(&self, v4: Option<Ipv4Addr>, dom: String, tun: TUNResponse) -> Result<()> {
         self.apply_evictions();
