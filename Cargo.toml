@@ -49,6 +49,7 @@ tun-rs = { workspace = true }
 tracing = "0.1.41"
 
 flume = "0.11.1"
+twox-hash = { version = "=2.1.2", features = ["xxhash3_128"] }
 
 [dev-dependencies]
 rand = "0.8.5"

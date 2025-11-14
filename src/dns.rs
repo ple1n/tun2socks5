@@ -27,6 +27,7 @@ use trust_dns_proto::{
     op::{Message, ResponseCode},
     rr::{record_type::RecordType, Name, RData, Record},
 };
+use twox_hash::xxhash3_128;
 
 pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u32) -> Result<Message> {
     let record = match ip {
@@ -104,9 +105,9 @@ use crate::error::Result;
 use crate::POOL_SIZE;
 
 use bimap::{BiHashMap, BiMap};
-use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A};
+use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A, Ipv6Network};
 use id_alloc::{Ipv4Network, NetRange};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::ops::{Deref, RangeInclusive};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -126,6 +127,7 @@ pub struct VirtDNSAsync {
     pub subnet: Ipv4Network,
     pub range: RangeInclusive<Ipv4A>,
     pub handle: VirtDNSHandle,
+    pub subnet6: Ipv6Network,
 }
 
 type PoolEntry = Arc<PoolEntryT>;
@@ -182,7 +184,7 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
         match val {
             DomainEntry::Pinned(ip) => {
                 warn!("evicting pinned {}", ip.addr);
-            },
+            }
             DomainEntry::Pool(val) => {
                 info!("evict {} -> {:?}", key, val.lock);
                 self.evicted.push(*val.lock);
@@ -222,7 +224,25 @@ const IP_HITS: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn init_virtdns() {
-    let virt = VirtDNSAsync::default(POOL_SIZE);
+    let virt = VirtDNSAsync::default(POOL_SIZE).unwrap();
+    dbg!(&virt.subnet6);
+    let net = virt.subnet6;
+    println!("{:b}", net.mask().to_bits());
+    println!("{:b}", !net.mask().to_bits());
+    let hash = xxhash3_128::Hasher::oneshot("veth.host6.".as_bytes());
+    println!("hash, {:b}", hash);
+    let truncated = hash & !net.mask().to_bits();
+    let net = truncated | net.network().to_bits();
+    println!("ip {:?}", net);
+    let ip = Ipv6Addr::from_bits(net);
+    println!("ip {:?}", ip);
+
+}
+
+#[test]
+fn test_hash() {
+    let hash = xxhash3_128::Hasher::oneshot("veth.host6.".as_bytes());
+    println!("hash, {}", hash);
 }
 
 impl VirtDNSAsync {
@@ -254,6 +274,7 @@ impl VirtDNSAsync {
                 range,
             },
             subnet,
+            subnet6: "fc00::/7".parse()?,
         };
         virt.handle
             .pin(Some("100.120.0.1".parse()?), "veth.host.".to_owned(), TUNResponse::Unreachable);
@@ -332,7 +353,7 @@ impl VirtDNSHandle {
                 }
                 match entry {
                     None => VDNSRES::NormalProxying,
-                    Some(h) => VDNSRES::SpecialHandling(h)
+                    Some(h) => VDNSRES::SpecialHandling(h),
                 }
             }
             k => VDNSRES::NormalProxying,
