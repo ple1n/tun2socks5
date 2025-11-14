@@ -282,6 +282,27 @@ impl VirtDNSAsync {
             .pin(Some("100.120.0.2".parse()?), "veth.peer.".to_owned(), TUNResponse::Unreachable);
         Ok(virt)
     }
+
+    /// Convert a domain name into a deterministic IPv6 address inside `self.subnet6`.
+    ///
+    /// The algorithm hashes the provided domain string using xxhash3_128, takes
+    /// the low-order host bits (clearing the network mask bits) and then ORs
+    /// them with the subnet network base bits to produce an `Ipv6Addr` inside
+    /// `self.subnet6`.
+    pub fn domain_to_ipv6(&self, domain: &str) -> Ipv6Addr {
+        // Compute 128-bit hash of domain
+        let hash = xxhash3_128::Hasher::oneshot(domain.as_bytes());
+
+        // network mask and network base as 128-bit integers
+        let mask_bits = self.subnet6.mask().to_bits();
+        let network_bits = self.subnet6.network().to_bits();
+
+        // keep only host bits from hash, then set network bits
+        let truncated = hash & !mask_bits;
+        let combined = truncated | network_bits;
+
+        Ipv6Addr::from_bits(combined)
+    }
 }
 
 impl VirtDNSHandle {
