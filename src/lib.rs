@@ -190,11 +190,9 @@ pub async fn main_entry(
                         }
 
                         anyhow::Ok(())
-                        // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                     });
                 }
                 IpStackStream::Udp(mut udp) => {
-                    // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
                     let resolv = vh.process(udp.peer_addr());
                     let to_proxy = match &resolv {
                         VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
