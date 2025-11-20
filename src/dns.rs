@@ -365,9 +365,17 @@ impl VirtDNSHandle {
         let qname = extract_domain_from_dns_message(&message)?;
         info!("VirtDNS recved {}", qname);
         if self.aaaa_only {
-            let ip = self.respond_v6(qname.clone())?;
-            let message = build_dns_response(message, &qname, ip.into(), 5)?;
-            Ok(message.to_vec()?)
+            // V4 mappings are still handled, but only for presets
+            // New mappings aren't added if they don't exist
+            if let Some(hit) = self.f_domain.get(&qname) {
+                let addr = hit.addr();
+                let message = build_dns_response(message, &qname, addr.into(), 5)?;
+                Ok(message.to_vec()?)
+            } else {
+                let ip = self.respond_v6(qname.clone())?;
+                let message = build_dns_response(message, &qname, ip.into(), 5)?;
+                Ok(message.to_vec()?)
+            }
         } else {
             let ip = self.to_respond_in_dns(qname.clone())?;
             let message = build_dns_response(message, &qname, ip.into(), 5)?;
@@ -406,10 +414,8 @@ impl VirtDNSHandle {
                         } else {
                             VDNSRES::NormalProxying
                         }
-                    },
-                    Some(h) => {
-                        VDNSRES::SpecialHandling(h)
                     }
+                    Some(h) => VDNSRES::SpecialHandling(h),
                 }
             }
             k => VDNSRES::NormalProxying,
