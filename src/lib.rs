@@ -219,7 +219,6 @@ pub async fn main_entry(
                                 }
                                 ArgDns::Handled => {
                                     let vh = vh.clone();
-                                    info!("virtdns spawn to reply");
                                     tokio::spawn(async move {
                                         let vh = vh;
                                         let mut pack = BytesMut::with_capacity(256);

@@ -281,10 +281,7 @@ impl VirtDNSAsync {
             },
             subnet,
         };
-        virt.handle
-            .pin(Some("100.120.0.1".parse()?), "veth.host.".to_owned(), TUNResponse::Unreachable);
-        virt.handle
-            .pin(Some("100.120.0.2".parse()?), "veth.peer.".to_owned(), TUNResponse::Unreachable);
+
         Ok(virt)
     }
 }
@@ -428,6 +425,8 @@ impl VirtDNSHandle {
         Ipv6A::new(ip, 128 - 7)
     }
     pub fn pin(&self, v4: Option<Ipv4Addr>, dom: String, tun: TUNResponse) -> Result<()> {
+        warn!("pin {:?} -> {}", v4, dom);
+
         self.apply_evictions();
         // Each data is a row with 3 columns.
         if let Some(hit) = self.f_domain.get(&dom) {
