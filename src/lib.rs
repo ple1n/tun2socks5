@@ -464,6 +464,7 @@ async fn handle_udp_associate_session(
 
 async fn handle_udp_nat(mut udp_stack: IpStackUdpStream, server_addr: SocketAddr) -> crate::Result<()> {
     let mut udp_server = UdpStream::connect(server_addr).await?;
+    debug!("UDP connected to {}", server_addr);
     copy_bidirectional(&mut udp_server, &mut udp_stack).await?;
 
     Ok(())
