@@ -160,26 +160,26 @@ pub async fn main_entry(
                 let mgr = mgr.clone();
                 let vh = vh.clone();
                 tokio::spawn(async move {
-                    let mut vdrs = vh.process(tcp.peer_addr());
-                    let mut to_proxy = None;
-                    match &vdrs {
-                        VDNSRES::ERR => {
-                            warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
-                        }
-                        VDNSRES::SpecialHandling(dst) => {
-                            to_proxy = match dst {
-                                TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
-                                _ => None,
-                            };
-                        }
-                        VDNSRES::NormalProxying => {
-                            if mgr.is_some() {
-                                to_proxy = Some(Address::SocketAddress(tcp.peer_addr()))
-                            } else {
-                                to_proxy = None;
-                                vdrs = VDNSRES::SpecialHandling(TUNResponse::Direct(tcp.peer_addr()))
+                    let mut vdrs;
+                    let mut to_proxy;
+                    if mgr.is_some() {
+                        to_proxy = Some(Address::SocketAddress(tcp.peer_addr()));
+                        vdrs = vh.process(tcp.peer_addr());
+                        match &vdrs {
+                            VDNSRES::ERR => {
+                                warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
                             }
+                            VDNSRES::SpecialHandling(dst) => {
+                                to_proxy = match dst {
+                                    TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
+                                    _ => None,
+                                };
+                            }
+                            VDNSRES::NormalProxying => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
                         }
+                    } else {
+                        vdrs = VDNSRES::SpecialHandling(TUNResponse::Direct(tcp.peer_addr()));
+                        to_proxy = None;
                     }
 
                     if let Some(dst) = to_proxy {
@@ -224,18 +224,22 @@ pub async fn main_entry(
                 });
             }
             IpStackStream::Udp(mut udp) => {
-                let mut resolv = vh.process(udp.peer_addr());
-                let mut to_proxy = match &resolv {
-                    VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
-                    VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
-                        Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
-                    }
-                    _ => None,
-                };
+                let mut resolv;
+                let mut to_proxy;
                 let peeraddr = udp.peer_addr();
+
                 if mgr.is_none() {
                     to_proxy = None;
                     resolv = VDNSRES::SpecialHandling(TUNResponse::Direct(peeraddr))
+                } else {
+                    resolv = vh.process(udp.peer_addr());
+                    to_proxy = match &resolv {
+                        VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
+                        VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
+                            Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
+                        }
+                        _ => None,
+                    };
                 }
 
                 if let Some(dst) = to_proxy {
@@ -289,7 +293,11 @@ pub async fn main_entry(
                 } else {
                     match resolv {
                         VDNSRES::SpecialHandling(TUNResponse::NATByTUN(host)) | VDNSRES::SpecialHandling(TUNResponse::Direct(host)) => {
-                            handle_udp_nat(udp, host).await?;
+                            info!("NAT UDP to {}", &host);
+                            tokio::spawn(async move {
+                                handle_udp_nat(udp, host).await?;
+                                aok!(())
+                            });
                         }
                         VDNSRES::SpecialHandling(TUNResponse::Files(root)) => {}
                         _ => {

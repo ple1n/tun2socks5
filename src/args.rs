@@ -80,8 +80,9 @@ pub struct IArgs {
     /// for self identifying.
     #[arg(long)]
     pub tun_name: Option<String>,
+    #[arg(long)]
     /// for debugging, makes TUN send traffic unproxied
-    pub debug: bool
+    pub debug: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]
