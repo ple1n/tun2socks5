@@ -212,6 +212,7 @@ pub enum TUNResponse {
     ProxiedHost(String),
     /// Warning. The connection is made by TUN process, which exists in SRC NS.
     NATByTUN(SocketAddr),
+    Direct(SocketAddr),
     Files(PathBuf),
     /// When the user has properly configured routing
     Unreachable,
