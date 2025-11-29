@@ -17,12 +17,13 @@ use futures::{
 };
 use id_alloc::NetRange;
 use ipstack::{
-    IpStackConfig, TUNDev, stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, tcp::TcpConfig}
+    stream::{tcp::TcpConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream},
+    IpStackConfig, TUNDev,
 };
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
-use socks5_impl::protocol::Address;
+use socks5_impl::protocol::{Address, UserKey};
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
@@ -88,6 +89,13 @@ pub struct VirtDNSChange {
     pub target: TUNResponse,
 }
 
+#[derive(Clone)]
+pub struct ProxyInst {
+    mgr: Arc<dyn ConnectionManager>,
+    server_addr: SocketAddr,
+    key: Option<UserKey>,
+}
+
 pub async fn main_entry(
     device: TUNDev,
     mtu: u16,
@@ -97,117 +105,128 @@ pub async fn main_entry(
     st_sx: flume::Sender<(PathBuf, IpStackTcpStream)>,
 ) -> crate::Result<()> {
     use dns::VirtDNSAsync as VirtDNS;
-    if let Some(argproxy) = args.proxy {
+
+    let dns_addr = args.dns_addr;
+    let ipv6_enabled = args.ipv6_enabled;
+    let mut vdns = VirtDNS::default(POOL_SIZE)?;
+    if let Some(fp) = args.designated {
+        info!("load user-designated name mappings from {:?}", &fp);
+        let mut f = tokio::fs::File::open(fp).await?;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).await?;
+        let desig: bimap::BiHashMap<Ipv4Addr, String> = serde_json::from_str(&buf)?;
+
+        todo!()
+    }
+    use socks5_impl::protocol::Version::{V4, V5};
+    let mgr = if let Some(argproxy) = args.proxy {
         let server_addr = argproxy.addr;
-
         let key = argproxy.credentials.clone();
-        let dns_addr = args.dns_addr;
-        let ipv6_enabled = args.ipv6_enabled;
-        let mut vdns = VirtDNS::default(POOL_SIZE)?;
-        if let Some(fp) = args.designated {
-            info!("load user-designated name mappings from {:?}", &fp);
-            let mut f = tokio::fs::File::open(fp).await?;
-            let mut buf = String::new();
-            f.read_to_string(&mut buf).await?;
-            let desig: bimap::BiHashMap<Ipv4Addr, String> = serde_json::from_str(&buf)?;
+        let key1 = key.clone();
+        Some(ProxyInst {
+            mgr: match argproxy.proxy_type {
+                ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)) as Arc<dyn ConnectionManager>,
+                ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)) as Arc<dyn ConnectionManager>,
+                ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)) as Arc<dyn ConnectionManager>,
+            },
+            server_addr,
+            key: key1,
+        })
+    } else {
+        None
+    };
+    let conf = IpStackConfig {
+        mtu,
+        packet_information: packet_info,
+        udp_timeout: Duration::from_secs(20),
+        tcp_config: Arc::new(TcpConfig::default()),
+    };
 
-            todo!()
-        }
-        use socks5_impl::protocol::Version::{V4, V5};
-        let mgr = match argproxy.proxy_type {
-            ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)) as Arc<dyn ConnectionManager>,
-            ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)) as Arc<dyn ConnectionManager>,
-            ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)) as Arc<dyn ConnectionManager>,
-        };
-        let conf = IpStackConfig {
-            mtu,
-            packet_information: packet_info,
-            udp_timeout: Duration::from_secs(20),
-            tcp_config: Arc::new(TcpConfig::default())
-        };
+    let vh = vdns.handle.clone();
+    dns_sx.send(Some(vh.clone())).await;
 
-        let vh = vdns.handle.clone();
-        dns_sx.send(Some(vh.clone())).await;
+    use nsproxy_common::rpc::*;
 
-        use nsproxy_common::rpc::*;
+    let mut ip_stack = ipstack::IpStack::new(conf, device);
 
-        let mut ip_stack = ipstack::IpStack::new(conf, device);
-
-        loop {
-            debug!("Wait for new stream");
-            let ip_stack_stream = ip_stack.accept().await?;
-            let stream_sx = st_sx.clone();
-            match ip_stack_stream {
-                IpStackStream::Tcp(tcp) => {
-                    // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                    let mgr = mgr.clone();
-                    let vh = vh.clone();
-                    tokio::spawn(async move {
-                        let vdrs = vh.process(tcp.peer_addr());
-                        let mut to_proxy = None;
-                        match &vdrs {
-                            VDNSRES::ERR => {
-                                warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
-                            }
-                            VDNSRES::SpecialHandling(dst) => {
-                                to_proxy = match dst {
-                                    TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
-                                    _ => None,
-                                };
-                            }
-                            VDNSRES::NormalProxying => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
+    loop {
+        debug!("Wait for new stream");
+        let ip_stack_stream = ip_stack.accept().await?;
+        let stream_sx = st_sx.clone();
+        match ip_stack_stream {
+            IpStackStream::Tcp(tcp) => {
+                // trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
+                let mgr = mgr.clone();
+                let vh = vh.clone();
+                tokio::spawn(async move {
+                    let vdrs = vh.process(tcp.peer_addr());
+                    let mut to_proxy = None;
+                    match &vdrs {
+                        VDNSRES::ERR => {
+                            warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
                         }
+                        VDNSRES::SpecialHandling(dst) => {
+                            to_proxy = match dst {
+                                TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
+                                _ => None,
+                            };
+                        }
+                        VDNSRES::NormalProxying => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
+                    }
 
-                        if let Some(dst) = to_proxy {
-                            let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
+                    if let Some(dst) = to_proxy {
+                        let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
+                        if let Some(ProxyInst { mgr, server_addr, key }) = mgr.clone() {
                             let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                             if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
                                 // This kind of error causes mid-connection drop.
                                 // An error in TCP is handled by state transition internally.
-                                error!("Error that causes drop. {} {:?}", info, err);
-                            }
-                        } else {
-                            match vdrs {
-                                VDNSRES::SpecialHandling(dst) => match dst {
-                                    TUNResponse::NATByTUN(sock) => {
-                                        if let Err(err) = handle_tcp_nat(tcp, sock).await {
-                                            info!("tcp drop {} {}", sock, err);
-                                        }
-                                    }
-                                    TUNResponse::Files(root) => {
-                                        info!("tun: serve files at {:?}", root);
-                                        let k = stream_sx.send_async((root, tcp)).await;
-                                        if k.is_err() {
-                                            warn!("{:?}", k);
-                                        }
-                                    }
-                                    _ => {
-                                        warn!("unexpected traffic, indicating misconfigured routing")
-                                    }
-                                },
-                                _ => {}
+                                error!("Conn dropped {} {:?}", info, err);
                             }
                         }
+                    } else {
+                        match vdrs {
+                            VDNSRES::SpecialHandling(dst) => match dst {
+                                TUNResponse::NATByTUN(sock) => {
+                                    if let Err(err) = handle_tcp_nat(tcp, sock).await {
+                                        info!("tcp drop {} {}", sock, err);
+                                    }
+                                }
+                                TUNResponse::Files(root) => {
+                                    info!("tun: serve files at {:?}", root);
+                                    let k = stream_sx.send_async((root, tcp)).await;
+                                    if k.is_err() {
+                                        warn!("{:?}", k);
+                                    }
+                                }
+                                _ => {
+                                    warn!("unexpected traffic, indicating misconfigured routing")
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
 
-                        anyhow::Ok(())
-                    });
-                }
-                IpStackStream::Udp(mut udp) => {
-                    let resolv = vh.process(udp.peer_addr());
-                    let to_proxy = match &resolv {
-                        VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
-                        VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
-                            Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
-                        }
-                        _ => None,
-                    };
-                    let peeraddr = udp.peer_addr();
-                    if let Some(dst) = to_proxy {
-                        let port = dst.port();
-                        let info = SessionInfo::new(udp.local_addr(), dst, IpProtocol::Udp);
-                        if port == DNS_PORT {
-                            match args.dns {
-                                ArgDns::OverTcp => {
+                    anyhow::Ok(())
+                });
+            }
+            IpStackStream::Udp(mut udp) => {
+                let resolv = vh.process(udp.peer_addr());
+                let to_proxy = match &resolv {
+                    VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
+                    VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
+                        Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
+                    }
+                    _ => None,
+                };
+                let peeraddr = udp.peer_addr();
+                if let Some(dst) = to_proxy {
+                    let port = dst.port();
+                    let info = SessionInfo::new(udp.local_addr(), dst, IpProtocol::Udp);
+                    if port == DNS_PORT {
+                        match args.dns {
+                            ArgDns::OverTcp => {
+                                if let Some(ProxyInst { mgr, server_addr, key }) = mgr.clone() {
                                     let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                                     tokio::spawn(async move {
                                         if let Err(err) = handle_dns_over_tcp_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
@@ -215,29 +234,32 @@ pub async fn main_entry(
                                         }
                                         // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                                     });
-                                    continue;
                                 }
-                                ArgDns::Handled => {
-                                    let vh = vh.clone();
-                                    tokio::spawn(async move {
-                                        let vh = vh;
-                                        let mut pack = BytesMut::with_capacity(256);
-                                        while udp.read_buf(&mut pack).await? > 0 {
-                                            let k = vh.receive_query(&pack);
-                                            if let Ok(k) = k {
-                                                udp.write_all(&k).await?;
-                                            } else {
-                                                error!("udp:dns error decoding {:?}", k);
-                                            }
-                                            pack.clear();
-                                        }
-                                        crate::Result::<()>::Ok(())
-                                    });
-                                    continue;
-                                }
-                                ArgDns::Direct => {}
+
+                                continue;
                             }
+                            ArgDns::Handled => {
+                                let vh = vh.clone();
+                                tokio::spawn(async move {
+                                    let vh = vh;
+                                    let mut pack = BytesMut::with_capacity(256);
+                                    while udp.read_buf(&mut pack).await? > 0 {
+                                        let k = vh.receive_query(&pack);
+                                        if let Ok(k) = k {
+                                            udp.write_all(&k).await?;
+                                        } else {
+                                            error!("udp:dns error decoding {:?}", k);
+                                        }
+                                        pack.clear();
+                                    }
+                                    crate::Result::<()>::Ok(())
+                                });
+                                continue;
+                            }
+                            ArgDns::Direct => {}
                         }
+                    }
+                    if let Some(ProxyInst { mgr, server_addr, key }) = mgr.clone() {
                         let proxy_handler = mgr.new_proxy_handler(info.clone(), true).await?;
                         tokio::spawn(async move {
                             if let Err(err) = handle_udp_associate_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
@@ -245,15 +267,15 @@ pub async fn main_entry(
                             }
                             // trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
                         });
-                    } else {
-                        match resolv {
-                            VDNSRES::SpecialHandling(TUNResponse::NATByTUN(host)) => {
-                                handle_udp_nat(udp, host).await?;
-                            }
-                            VDNSRES::SpecialHandling(TUNResponse::Files(root)) => {}
-                            _ => {
-                                warn!("Invalid VirtDNS Addr {}", peeraddr);
-                            }
+                    }
+                } else {
+                    match resolv {
+                        VDNSRES::SpecialHandling(TUNResponse::NATByTUN(host)) => {
+                            handle_udp_nat(udp, host).await?;
+                        }
+                        VDNSRES::SpecialHandling(TUNResponse::Files(root)) => {}
+                        _ => {
+                            warn!("Invalid VirtDNS Addr {}", peeraddr);
                         }
                     }
                 }

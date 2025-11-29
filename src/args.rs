@@ -78,9 +78,10 @@ pub struct IArgs {
     #[arg(long)]
     pub id: Option<usize>,
     /// for self identifying.
-    /// also used as default name when creating a new node
     #[arg(long)]
     pub tun_name: Option<String>,
+    /// for debugging, makes TUN send traffic unproxied
+    pub debug: bool
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]
