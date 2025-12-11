@@ -69,7 +69,7 @@ pub struct IArgs {
     pub dns_addr: IpAddr,
 
     /// IPs used in routing setup which should bypass the tunnel
-    #[arg(short, long, value_name = "IP")]
+    #[arg(long, value_name = "IP")]
     pub bypass: Vec<IpAddr>,
 
     #[arg(long)]
