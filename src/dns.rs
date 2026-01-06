@@ -7,7 +7,7 @@ use id_alloc::opool::RcGuard;
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::{Deserialize, Serialize};
-use socks5_impl::protocol::Address;
+use socks5_impl::protocol::WireAddress;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::{Hash, RandomState};
@@ -102,7 +102,7 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
 }
 
 use crate::error::Result;
-use crate::POOL_SIZE;
+use crate::{ArgProxy, POOL_SIZE};
 
 use bimap::{BiHashMap, BiMap};
 use id_alloc::{lock_alloc, IDAlloc, IPOps, Ipv4A, Ipv6A, Ipv6Network};
@@ -216,6 +216,10 @@ pub enum TUNResponse {
     Files(PathBuf),
     /// When the user has properly configured routing
     Unreachable,
+    SpecifiedProxy(
+        WireAddress,
+        ArgProxy
+    )
 }
 
 const LRU: usize = 4096;

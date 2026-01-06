@@ -23,7 +23,7 @@ use ipstack::{
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
-use socks5_impl::protocol::{Address, UserKey};
+use socks5_impl::protocol::{WireAddress, UserKey};
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
@@ -163,7 +163,7 @@ pub async fn main_entry(
                     let mut vdrs;
                     let mut to_proxy;
                     if mgr.is_some() {
-                        to_proxy = Some(Address::SocketAddress(tcp.peer_addr()));
+                        to_proxy = Some(WireAddress::SocketAddress(tcp.peer_addr()));
                         vdrs = vh.process(tcp.peer_addr());
                         match &vdrs {
                             VDNSRES::ERR => {
@@ -171,11 +171,11 @@ pub async fn main_entry(
                             }
                             VDNSRES::SpecialHandling(dst) => {
                                 to_proxy = match dst {
-                                    TUNResponse::ProxiedHost(host) => Some(Address::DomainAddress(host.clone(), tcp.peer_addr().port())),
+                                    TUNResponse::ProxiedHost(host) => Some(WireAddress::DomainAddress(host.clone(), tcp.peer_addr().port())),
                                     _ => None,
                                 };
                             }
-                            VDNSRES::NormalProxying => to_proxy = Some(Address::SocketAddress(tcp.peer_addr())),
+                            VDNSRES::NormalProxying => to_proxy = Some(WireAddress::SocketAddress(tcp.peer_addr())),
                         }
                     } else {
                         vdrs = VDNSRES::SpecialHandling(TUNResponse::Direct(tcp.peer_addr()));
@@ -234,9 +234,9 @@ pub async fn main_entry(
                 } else {
                     resolv = vh.process(udp.peer_addr());
                     to_proxy = match &resolv {
-                        VDNSRES::NormalProxying => Some(Address::SocketAddress(udp.peer_addr())),
+                        VDNSRES::NormalProxying => Some(WireAddress::SocketAddress(udp.peer_addr())),
                         VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
-                            Some(Address::DomainAddress(host.to_owned(), udp.peer_addr().port()))
+                            Some(WireAddress::DomainAddress(host.to_owned(), udp.peer_addr().port()))
                         }
                         _ => None,
                     };

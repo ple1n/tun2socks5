@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
-use socks5_impl::protocol::Address;
+use socks5_impl::protocol::WireAddress;
 
 #[allow(dead_code)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug, Default)]
@@ -26,7 +26,7 @@ impl std::fmt::Display for IpProtocol {
 #[derive(Hash, Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
 pub(crate) struct SessionInfo {
     pub(crate) src: SocketAddr,
-    pub(crate) dst: Address,
+    pub(crate) dst: WireAddress,
     pub(crate) protocol: IpProtocol,
     id: u64,
 }
@@ -42,7 +42,7 @@ impl Default for SessionInfo {
 static SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SessionInfo {
-    pub fn new(src: SocketAddr, dst: Address, protocol: IpProtocol) -> Self {
+    pub fn new(src: SocketAddr, dst: WireAddress, protocol: IpProtocol) -> Self {
         // let id = SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = 0;
         Self { src, dst, protocol, id }

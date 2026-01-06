@@ -5,7 +5,7 @@ use crate::{
     session_info::SessionInfo,
 };
 use anyhow::bail;
-use socks5_impl::protocol::{self, handshake, password_method, Address, AuthMethod, StreamOperation, UserKey, Version};
+use socks5_impl::protocol::{self, handshake, password_method, WireAddress, AuthMethod, StreamOperation, UserKey, Version};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::*;
@@ -60,7 +60,7 @@ impl SocksProxyImpl {
         let mut ip_vec = Vec::<u8>::new();
         let name_vec = Vec::<u8>::new();
         match &self.info.dst {
-            Address::SocketAddress(sock) => match sock {
+            WireAddress::SocketAddress(sock) => match sock {
                 SocketAddr::V4(addr) => {
                     ip_vec.extend(addr.ip().octets().as_ref());
                 }
@@ -187,7 +187,7 @@ impl SocksProxyImpl {
 
     fn send_request_socks5(&mut self) -> Result<()> {
         let addr = if self.command == protocol::Command::UdpAssociate {
-            Address::unspecified()
+            WireAddress::unspecified()
         } else {
             self.info.dst.clone()
         };
