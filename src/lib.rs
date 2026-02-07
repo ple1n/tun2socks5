@@ -293,7 +293,7 @@ pub async fn main_entry(
                 } else {
                     match resolv {
                         VDNSRES::SpecialHandling(TUNResponse::NATByTUN(host)) | VDNSRES::SpecialHandling(TUNResponse::Direct(host)) => {
-                            info!("NAT UDP to {}", &host);
+                            info!("UDP protocol: NAT to {}. {:?}", &host, resolv);
                             tokio::spawn(async move {
                                 handle_udp_nat(udp, host).await?;
                                 aok!(())
