@@ -83,6 +83,10 @@ pub struct IArgs {
     #[arg(long)]
     /// for debugging, makes TUN send traffic unproxied
     pub debug: bool,
+    /// Path for the diagnostics UNIX socket (set by nsproxy)
+    #[arg(long)]
+    #[serde(default)]
+    pub diag_sock: Option<PathBuf>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Deserialize, Serialize)]

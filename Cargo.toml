@@ -47,6 +47,7 @@ concurrent-map = "5.0.37"
 crossbeam = "0.8.4"
 tun-rs = { workspace = true }
 tracing = "0.1.41"
+diag = { path = "../diag" }
 
 flume = "0.11.1"
 twox-hash = { version = "=2.1.2", features = ["xxhash3_128"] }
