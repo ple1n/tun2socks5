@@ -325,15 +325,55 @@ pub async fn main_entry(
                         }
                     } else if port == DNS_PORT && matches!(args.dns, ArgDns::Handled) {
                         let vh = vh.clone();
+                        let diag = diag.clone();
                         tokio::spawn(async move {
                             let vh = vh;
                             let mut pack = BytesMut::with_capacity(256);
                             while udp.read_buf(&mut pack).await? > 0 {
+                                let query = match dns::parse_data_to_dns_message(&pack, false)
+                                    .and_then(|m| dns::extract_domain_from_dns_message(&m))
+                                {
+                                    Ok(q) => {
+                                        diag.emit(DiagEvent::DnsQuery {
+                                            id: conn_id,
+                                            ts: Timestamp::now(),
+                                            query: q.clone(),
+                                        });
+                                        Some(q)
+                                    }
+                                    Err(e) => {
+                                        warn!("udp:dns query parse error: {}", e);
+                                        None
+                                    }
+                                };
+
                                 let k = vh.receive_query(&pack);
-                                if let Ok(k) = k {
-                                    udp.write_all(&k).await?;
+                                if let Ok(resp) = k {
+                                    if let Some(q) = query.clone() {
+                                        let result = match dns::parse_data_to_dns_message(&resp, false)
+                                            .and_then(|m| dns::extract_ipaddr_from_dns_message(&m))
+                                        {
+                                            Ok(ip) => ip.to_string(),
+                                            Err(e) => format!("err: {}", e),
+                                        };
+                                        diag.emit(DiagEvent::DnsResolved {
+                                            id: conn_id,
+                                            ts: Timestamp::now(),
+                                            domain: q,
+                                            result,
+                                        });
+                                    }
+                                    udp.write_all(&resp).await?;
                                 } else {
-                                    error!("udp:dns error decoding {:?}", k);
+                                    let err = k.err().unwrap();
+                                    let domain = query.unwrap_or_else(|| "<parse-error>".to_string());
+                                    diag.emit(DiagEvent::DnsResolved {
+                                        id: conn_id,
+                                        ts: Timestamp::now(),
+                                        domain,
+                                        result: format!("err: {}", err),
+                                    });
+                                    error!("udp:dns error decoding {:?}", err);
                                 }
                                 pack.clear();
                             }
