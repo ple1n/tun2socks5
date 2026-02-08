@@ -240,11 +240,6 @@ pub enum TUNResponse {
 const LRU: usize = 16384;
 const LRU_IPV6: usize = 8192;
 
-// DNS metrics
-const LRU_IP_HITS: AtomicUsize = AtomicUsize::new(0);
-const DOMAIN_HITS: AtomicUsize = AtomicUsize::new(0);
-const IP_HITS: AtomicUsize = AtomicUsize::new(0);
-
 #[test]
 fn init_virtdns() {
     let virt = VirtDNSAsync::default(POOL_SIZE).unwrap();
@@ -319,6 +314,7 @@ impl VirtDNSHandle {
     /// the low-order host bits (clearing the network mask bits) and then ORs
     /// them with the subnet network base bits to produce an `Ipv6Addr` inside
     /// `self.subnet6`.
+    #[inline]
     pub fn domain_to_ipv6(&self, domain: &str) -> Ipv6Addr {
         // Compute 128-bit hash of domain
         let hash = xxhash3_128::Hasher::oneshot(domain.as_bytes());
@@ -334,13 +330,6 @@ impl VirtDNSHandle {
         Ipv6Addr::from_bits(combined)
     }
 
-    pub fn respond_v6(&self, dom: String) -> Result<Ipv6Addr> {
-        let ip = self.domain_to_ipv6(&dom);
-        let ipa = self.ipv6a(ip);
-        self.ip6.insert(ipa, TUNResponse::ProxiedHost(dom));
-        Ok(ip)
-    }
-
     pub async fn periodic_report(self) {
         // tokio::spawn(async move {
         //     loop {
@@ -349,33 +338,41 @@ impl VirtDNSHandle {
         //     }
         // });
     }
+    #[inline]
     pub fn to_respond_in_dns(&self, dom: String) -> Result<Ipv4Addr> {
-        trace!("virtdns: alloc {}", dom);
-        self.apply_evictions();
-        IP_HITS.fetch_add(1, Ordering::SeqCst);
+        // Fast path: check cache first without evictions
         if let Some(hit) = self.f_domain.get(&dom) {
-            let addr = hit.addr();
-            Ok(addr)
-        } else {
-            let own = Arc::new(PoolEntryT {
-                lock: self.alloc.pool.clone().get_rc(),
-                pinned: false,
-            });
-            trace!("got object from pool");
-            let addr = own.lock.addr;
-            self.f_ip.insert(
-                *own.lock,
-                IPKeyEntry {
-                    domain: TUNResponse::ProxiedHost(dom.clone()),
-                    lifetime: own.clone().into(),
-                },
-            );
-            self.f_domain.insert(dom, DomainEntry::Pool(own));
-            Ok(addr)
+            return Ok(hit.addr());
         }
+        
+        trace!("virtdns: alloc {}", dom);
+        
+        // Slow path: allocate new entry and apply evictions
+        let own = Arc::new(PoolEntryT {
+            lock: self.alloc.pool.clone().get_rc(),
+            pinned: false,
+        });
+        let addr = own.lock.addr;
+        let ip_key = *own.lock;
+        
+        // Insert both mappings before eviction to ensure atomicity
+        self.f_domain.insert(dom.clone(), DomainEntry::Pool(own.clone()));
+        self.f_ip.insert(
+            ip_key,
+            IPKeyEntry {
+                domain: TUNResponse::ProxiedHost(dom),
+                lifetime: own.into(),
+            },
+        );
+        
+        // Apply evictions after successful allocation
+        self.apply_evictions();
+        
+        Ok(addr)
     }
     pub fn apply_evictions(&self) {
-        loop {
+        // Batch process evictions - up to 16 at once to amortize cost
+        for _ in 0..16 {
             if let Some(ev) = self.evicted.pop() {
                 self.f_ip.remove(&ev);
             } else {
@@ -383,64 +380,67 @@ impl VirtDNSHandle {
             }
         }
     }
+    #[inline]
     pub fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
+        
         if self.aaaa_only {
-            // V4 mappings are still handled, but only for presets
-            // New mappings aren't added if they don't exist
+            // Fast path: check if v4 mapping exists first (most common for presets)
             if let Some(hit) = self.f_domain.get(&qname) {
                 let addr = hit.addr();
                 let message = build_dns_response(message, &qname, addr.into(), 5)?;
-                Ok(message.to_vec()?)
-            } else {
-                let ip = self.respond_v6(qname.clone())?;
-                let message = build_dns_response(message, &qname, ip.into(), 5)?;
-                Ok(message.to_vec()?)
+                return Ok(message.to_vec()?);
             }
+            
+            // Slow path: create new IPv6 mapping
+            let ip = self.domain_to_ipv6(&qname);
+            let ipa = self.ipv6a(ip);
+            self.ip6.insert(ipa, TUNResponse::ProxiedHost(qname.clone()));
+            let message = build_dns_response(message, &qname, ip.into(), 5)?;
+            Ok(message.to_vec()?)
         } else {
             let ip = self.to_respond_in_dns(qname.clone())?;
             let message = build_dns_response(message, &qname, ip.into(), 5)?;
             Ok(message.to_vec()?)
         }
     }
+    #[inline]
     pub fn process(&self, addr: SocketAddr) -> VDNSRES {
         match addr {
             SocketAddr::V4(v4) => {
-                let v4a = self.ipv4a(v4.ip().to_owned());
-                let entry = if let Some(IPKeyEntry { domain, lifetime }) = self.f_ip.get(&v4a) {
-                    Some(domain)
-                } else {
-                    None
-                };
-
-                if self.range.contains(&v4.ip().to_owned().into()) {
-                    if !entry.is_some() {
-                        warn!("virtdns: address with no associated domain, {}", &v4);
-                        return VDNSRES::ERR;
-                    }
+                let ip = v4.ip().to_owned();
+                let v4a = self.ipv4a(ip);
+                
+                // Fast path: check range first to avoid map lookup for non-virtual IPs
+                if !self.range.contains(&ip.into()) {
+                    return VDNSRES::NormalProxying;
                 }
-                match entry {
-                    None => VDNSRES::NormalProxying,
-                    Some(h) => VDNSRES::SpecialHandling(h),
+                
+                // Lookup in map
+                if let Some(IPKeyEntry { domain, .. }) = self.f_ip.get(&v4a) {
+                    VDNSRES::SpecialHandling(domain)
+                } else {
+                    warn!("virtdns: address with no associated domain, {}", &v4);
+                    VDNSRES::ERR
                 }
             }
             SocketAddr::V6(v6) => {
-                let v6a = self.ipv6a(v6.ip().to_owned());
-                let entry = self.ip6.get(&v6a);
-                match entry {
-                    None => {
-                        if self.subnet6.contains(*v6.ip()) {
-                            warn!("VirtDNSv6, entry not found");
-                            VDNSRES::ERR
-                        } else {
-                            VDNSRES::NormalProxying
-                        }
-                    }
-                    Some(h) => VDNSRES::SpecialHandling(h),
+                let ip = v6.ip().to_owned();
+                
+                // Fast path: check subnet first
+                if !self.subnet6.contains(ip) {
+                    return VDNSRES::NormalProxying;
+                }
+                
+                let v6a = self.ipv6a(ip);
+                if let Some(h) = self.ip6.get(&v6a) {
+                    VDNSRES::SpecialHandling(h)
+                } else {
+                    warn!("VirtDNSv6, entry not found");
+                    VDNSRES::ERR
                 }
             }
-            k => VDNSRES::NormalProxying,
         }
     }
     pub fn ipv4a(&self, ip: Ipv4Addr) -> Ipv4A {
