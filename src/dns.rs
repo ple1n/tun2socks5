@@ -140,7 +140,7 @@ pub struct PoolEntryT {
 #[derive(Clone)]
 pub struct VirtDNSHandle {
     f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
-    ip6: ConcurrentMap<Ipv6A, TUNResponse>,
+    ip6: Arc<Cache<Ipv6A, TUNResponse, UnitWeighter, DefaultHashBuilder, Ipv6Eviction>>,
     pub subnet6: Ipv6Network,
     f_domain: Arc<Cache<String, DomainEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
@@ -195,6 +195,21 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
     }
 }
 
+/// IPv6 eviction for unbounded cache cleanup
+#[derive(Clone)]
+struct Ipv6Eviction;
+
+impl Lifecycle<Ipv6A, TUNResponse> for Ipv6Eviction {
+    type RequestState = ();
+    fn is_pinned(&self, _key: &Ipv6A, _val: &TUNResponse) -> bool {
+        false
+    }
+    fn begin_request(&self) -> Self::RequestState {}
+    fn on_evict(&self, _state: &mut Self::RequestState, key: Ipv6A, val: TUNResponse) {
+        info!("evict ipv6 {:?} -> {:?}", key, val);
+    }
+}
+
 // when a client queries DNS, an IP is allocated to a domain
 // the clients will believe the IP associates with the domain for indefinite time
 // there is no way to determine when the clients stop believing this
@@ -222,7 +237,8 @@ pub enum TUNResponse {
     )
 }
 
-const LRU: usize = 4096;
+const LRU: usize = 16384;
+const LRU_IPV6: usize = 8192;
 
 // DNS metrics
 const LRU_IP_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -257,7 +273,6 @@ impl VirtDNSAsync {
         assert!(host_cap < subnet.size() as usize);
         let range = subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
-        let concmap6: ConcurrentMap<_, _> = Default::default();
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
         let virt = Self {
             range: range.clone(),
@@ -272,6 +287,13 @@ impl VirtDNSAsync {
                     DefaultHashBuilder::default(),
                     IPEviction { evicted: ev.clone() },
                 )),
+                ip6: Arc::new(Cache::with(
+                    LRU_IPV6,
+                    LRU_IPV6 as u64,
+                    UnitWeighter,
+                    DefaultHashBuilder::default(),
+                    Ipv6Eviction,
+                )),
                 evicted: ev,
                 f_ip: concmap,
                 alloc: Alloc::init(
@@ -282,7 +304,6 @@ impl VirtDNSAsync {
                     host_cap as usize,
                 ),
                 range,
-                ip6: concmap6,
             },
             subnet,
         };
@@ -365,7 +386,6 @@ impl VirtDNSHandle {
     pub fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
-        info!("VirtDNS recved {}", qname);
         if self.aaaa_only {
             // V4 mappings are still handled, but only for presets
             // New mappings aren't added if they don't exist

@@ -162,8 +162,16 @@ pub async fn main_entry(
     let mut ip_stack = ipstack::IpStack::new(conf, device);
 
     loop {
-        debug!("Wait for new stream");
+        let wait_id = next_conn_id();
+        diag.emit(DiagEvent::Wait {
+            id: wait_id,
+            ts: Timestamp::now(),
+        });
         let ip_stack_stream = ip_stack.accept().await?;
+        diag.emit(DiagEvent::WaitEnded {
+            id: wait_id,
+            ts: Timestamp::now(),
+        });
         let body_start = Instant::now();
         let stream_sx = st_sx.clone();
         let iter_conn_id;
