@@ -58,15 +58,15 @@ pub use {
 };
 
 mod args;
-mod directions;
+pub mod directions;
 pub mod dns;
-mod error;
-mod http;
+pub mod error;
+pub mod http;
 mod private_ip;
-mod proxy_handler;
+pub mod proxy_handler;
 mod route_config;
-mod session_info;
-mod socks;
+pub mod session_info;
+pub mod socks;
 
 pub use ipstack;
 pub use tun_rs;
