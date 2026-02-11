@@ -50,7 +50,8 @@ use tracing::{debug, error, info, trace, warn};
 use tun_rs::AsyncDevice;
 use udp_stream::UdpStream;
 pub use diag;
-use diag::{ConnRoute, DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
+use diag::{DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
+use nsproxy_common::routing::RoutingDecision;
 pub use {
     args::*,
     error::{Error, Result},
@@ -213,12 +214,15 @@ pub async fn main_entry(
                     }
 
                     if let Some(dst) = to_proxy {
-                        let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
                         diag.emit(DiagEvent::Route {
                             id: conn_id,
                             ts: Timestamp::now(),
-                            route: ConnRoute::Proxied { dest: format!("{}", info) },
+                            route: RoutingDecision::Proxy {
+                                target: dst.clone(),
+                                id: nsproxy_common::routing::ProxyID::Remote(tcp.peer_addr()),
+                            },
                         });
+                        let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
                         if let Some(ProxyInst { mgr, server_addr, key }) = mgr.clone() {
                             let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
                             diag.emit(DiagEvent::Connected { id: conn_id, ts: Timestamp::now() });
@@ -244,7 +248,7 @@ pub async fn main_entry(
                                 TUNResponse::NATByTUN(sock) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id, ts: Timestamp::now(),
-                                        route: ConnRoute::Nat { dest: sock.to_string() },
+                                        route: RoutingDecision::NATByTUN(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
@@ -258,7 +262,7 @@ pub async fn main_entry(
                                 TUNResponse::Direct(sock) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id, ts: Timestamp::now(),
-                                        route: ConnRoute::Direct { dest: sock.to_string() },
+                                        route: RoutingDecision::Direct(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
@@ -272,7 +276,10 @@ pub async fn main_entry(
                                 TUNResponse::Files(root) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id, ts: Timestamp::now(),
-                                        route: ConnRoute::FileServe { root: root.to_string_lossy().to_string() },
+                                        route: RoutingDecision::Proxy {
+                                            target: socks5_impl::protocol::WireAddress::SocketAddress(tcp.peer_addr()),
+                                            id: nsproxy_common::routing::ProxyID::File(root.clone()),
+                                        },
                                     });
                                     info!("tun: serve files at {:?}", root);
                                     let k = stream_sx.send_async((root, tcp)).await;
