@@ -219,7 +219,7 @@ pub async fn main_entry(
                             ts: Timestamp::now(),
                             route: RoutingDecision::Proxy {
                                 target: dst.clone(),
-                                id: nsproxy_common::routing::ProxyID::Remote(tcp.peer_addr()),
+                                id: nsproxy_common::routing::ProxyID::for_remote(tcp.peer_addr()),
                             },
                         });
                         let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
@@ -278,7 +278,7 @@ pub async fn main_entry(
                                         id: conn_id, ts: Timestamp::now(),
                                         route: RoutingDecision::Proxy {
                                             target: socks5_impl::protocol::WireAddress::SocketAddress(tcp.peer_addr()),
-                                            id: nsproxy_common::routing::ProxyID::File(root.clone()),
+                                            id: nsproxy_common::routing::ProxyID::for_file(root.as_path()),
                                         },
                                     });
                                     info!("tun: serve files at {:?}", root);
