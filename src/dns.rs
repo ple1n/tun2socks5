@@ -262,6 +262,12 @@ fn test_hash() {
     println!("hash, {}", hash);
 }
 
+pub static VIRT_IP: &str = "fc00::/7";
+
+pub fn default_virtip() -> Ipv6Network {
+    VIRT_IP.parse().unwrap()
+}
+
 impl VirtDNSAsync {
     pub fn default(host_cap: usize) -> Result<Self> {
         let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
@@ -272,7 +278,7 @@ impl VirtDNSAsync {
         let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
-                subnet6: "fc00::/7".parse()?,
+                subnet6: default_virtip() ,
                 aaaa_only: true,
 
                 f_domain: Arc::new(Cache::with(
