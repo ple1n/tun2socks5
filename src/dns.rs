@@ -388,17 +388,20 @@ impl VirtDNSHandle {
         let qname = extract_domain_from_dns_message(&message)?;
         
         if self.aaaa_only {
-            // Fast path: check if v4 mapping exists first (most common for presets)
             if let Some(hit) = self.f_domain.get(&qname) {
                 let addr = hit.addr();
                 let message = build_dns_response(message, &qname, addr.into(), 5)?;
                 return Ok(message.to_vec()?);
             }
-            
-            // Slow path: create new IPv6 mapping
+
+            // IPv6 address is deterministic from the domain name
             let ip = self.domain_to_ipv6(&qname);
             let ipa = self.ipv6a(ip);
-            self.ip6.insert(ipa, TUNResponse::ProxiedHost(qname.clone()));
+
+            if self.ip6.get(&ipa).is_none() {
+                self.ip6.insert(ipa, TUNResponse::ProxiedHost(qname.clone()));
+            }
+
             let message = build_dns_response(message, &qname, ip.into(), 5)?;
             Ok(message.to_vec()?)
         } else {
