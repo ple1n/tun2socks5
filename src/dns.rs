@@ -230,11 +230,7 @@ pub enum TUNResponse {
     Direct(SocketAddr),
     Files(PathBuf),
     /// When the user has properly configured routing
-    Unreachable,
-    SpecifiedProxy(
-        WireAddress,
-        ArgProxy
-    )
+    Unreachable
 }
 
 const LRU: usize = 16384;
