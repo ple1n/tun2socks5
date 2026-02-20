@@ -4,7 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use nsproxy_common::routing::{TUNResponse, VDNSRES};
+use nsproxy_common::routing::{DropReason, RoutingDecision, VDNSRES};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::{Deserialize, Serialize};
@@ -134,7 +134,7 @@ pub struct PoolEntryT {
 #[derive(Clone)]
 pub struct VirtDNSHandle {
     f_ip: ConcurrentMap<Ipv4A, IPKeyEntry>,
-    ip6: Arc<Cache<Ipv6A, TUNResponse, UnitWeighter, DefaultHashBuilder, Ipv6Eviction>>,
+    ip6: Arc<Cache<Ipv6A, RoutingDecision, UnitWeighter, DefaultHashBuilder, Ipv6Eviction>>,
     pub subnet6: Ipv6Network,
     f_domain: Arc<Cache<String, DomainEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
     alloc: lock_alloc::Alloc<Ipv4A>,
@@ -193,13 +193,13 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
 #[derive(Clone)]
 struct Ipv6Eviction;
 
-impl Lifecycle<Ipv6A, TUNResponse> for Ipv6Eviction {
+impl Lifecycle<Ipv6A, RoutingDecision> for Ipv6Eviction {
     type RequestState = ();
-    fn is_pinned(&self, _key: &Ipv6A, _val: &TUNResponse) -> bool {
+    fn is_pinned(&self, _key: &Ipv6A, _val: &RoutingDecision) -> bool {
         false
     }
     fn begin_request(&self) -> Self::RequestState {}
-    fn on_evict(&self, _state: &mut Self::RequestState, key: Ipv6A, val: TUNResponse) {
+    fn on_evict(&self, _state: &mut Self::RequestState, key: Ipv6A, val: RoutingDecision) {
         info!("evict ipv6 {:?} -> {:?}", key, val);
     }
 }
@@ -212,7 +212,7 @@ impl Lifecycle<Ipv6A, TUNResponse> for Ipv6Eviction {
 
 #[derive(Clone)]
 struct IPKeyEntry {
-    domain: TUNResponse,
+    domain: RoutingDecision,
     lifetime: Option<PoolEntry>,
 }
 
@@ -345,7 +345,7 @@ impl VirtDNSHandle {
         self.f_ip.insert(
             ip_key,
             IPKeyEntry {
-                domain: TUNResponse::ProxiedHost(dom),
+                domain: RoutingDecision::HostOverProxy(dom),
                 lifetime: own.into(),
             },
         );
@@ -382,7 +382,7 @@ impl VirtDNSHandle {
             let ipa = self.ipv6a(ip);
 
             if self.ip6.get(&ipa).is_none() {
-                self.ip6.insert(ipa, TUNResponse::ProxiedHost(qname.clone()));
+                self.ip6.insert(ipa, RoutingDecision::HostOverProxy(qname.clone()));
             }
 
             let message = build_dns_response(message, &qname, ip.into(), 5)?;
@@ -407,7 +407,7 @@ impl VirtDNSHandle {
                 
                 // Lookup in map
                 if let Some(IPKeyEntry { domain, .. }) = self.f_ip.get(&v4a) {
-                    VDNSRES::SpecialHandling(domain)
+                    VDNSRES::Opine(domain)
                 } else {
                     warn!("virtdns: address with no associated domain, {}", &v4);
                     VDNSRES::ERR
@@ -423,7 +423,7 @@ impl VirtDNSHandle {
                 
                 let v6a = self.ipv6a(ip);
                 if let Some(h) = self.ip6.get(&v6a) {
-                    VDNSRES::SpecialHandling(h)
+                    VDNSRES::Opine(h)
                 } else {
                     warn!("VirtDNSv6, entry not found");
                     VDNSRES::ERR
@@ -437,7 +437,7 @@ impl VirtDNSHandle {
     pub fn ipv6a(&self, ip: Ipv6Addr) -> Ipv6A {
         Ipv6A::new(ip, 128 - 7)
     }
-    pub fn pin(&self, v4: Option<Ipv4Addr>, dom: String, tun: TUNResponse) -> Result<()> {
+    pub fn pin(&self, v4: Option<Ipv4Addr>, dom: String, tun: RoutingDecision) -> Result<()> {
         warn!("pin {:?} -> {}", v4, dom);
 
         self.apply_evictions();

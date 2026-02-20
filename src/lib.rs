@@ -22,7 +22,7 @@ use ipstack::{
     stream::{tcp::TcpConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream},
     IpStackConfig, TUNDev,
 };
-use nsproxy_common::routing::RoutingDecision;
+use nsproxy_common::routing::{DropReason, RoutingDecision, RoutingResovled, VDNSRES};
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
@@ -89,7 +89,7 @@ const POOL_SIZE: usize = 65535;
 
 pub struct VirtDNSChange {
     pub domain: String,
-    pub target: TUNResponse,
+    pub target: RoutingDecision,
 }
 
 #[derive(Clone)]
@@ -206,9 +206,9 @@ pub async fn main_entry(
                             VDNSRES::ERR => {
                                 warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
                             }
-                            VDNSRES::SpecialHandling(dst) => {
+                            VDNSRES::Opine(dst) => {
                                 to_proxy = match dst {
-                                    TUNResponse::ProxiedHost(host) => {
+                                    RoutingDecision::HostOverProxy(host) => {
                                         Some(WireAddress::DomainAddress(host.clone(), tcp.peer_addr().port()))
                                     }
                                     _ => None,
@@ -217,7 +217,7 @@ pub async fn main_entry(
                             VDNSRES::NormalProxying => to_proxy = Some(WireAddress::SocketAddress(tcp.peer_addr())),
                         }
                     } else {
-                        vdrs = VDNSRES::SpecialHandling(TUNResponse::Direct(tcp.peer_addr()));
+                        vdrs = VDNSRES::Opine(RoutingDecision::Direct(tcp.peer_addr()));
                         to_proxy = None;
                     }
 
@@ -225,7 +225,7 @@ pub async fn main_entry(
                         diag.emit(DiagEvent::Route {
                             id: conn_id,
                             ts: Timestamp::now(),
-                            route: RoutingDecision::Proxy {
+                            route: RoutingResovled::ProxyResovled {
                                 target: dst.clone(),
                                 id: nsproxy_common::routing::ProxyID::for_remote(tcp.peer_addr()),
                             },
@@ -260,12 +260,12 @@ pub async fn main_entry(
                         }
                     } else {
                         match vdrs {
-                            VDNSRES::SpecialHandling(dst) => match dst {
-                                TUNResponse::NATByTUN(sock) => {
+                            VDNSRES::Opine(dst) => match dst {
+                                RoutingDecision::NATByTUN(sock) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id,
                                         ts: Timestamp::now(),
-                                        route: RoutingDecision::NATByTUN(sock),
+                                        route: RoutingResovled::NATByTUN(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
@@ -278,11 +278,11 @@ pub async fn main_entry(
                                         info!("tcp drop {} {}", sock, err);
                                     }
                                 }
-                                TUNResponse::Direct(sock) => {
+                                RoutingDecision::Direct(sock) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id,
                                         ts: Timestamp::now(),
-                                        route: RoutingDecision::Direct(sock),
+                                        route: RoutingResovled::Direct(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
@@ -295,11 +295,11 @@ pub async fn main_entry(
                                         info!("tcp drop {} {}", sock, err);
                                     }
                                 }
-                                TUNResponse::Files(root) => {
+                                RoutingDecision::File(root) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id,
                                         ts: Timestamp::now(),
-                                        route: RoutingDecision::Proxy {
+                                        route: RoutingResovled::ProxyResovled {
                                             target: socks5_impl::protocol::WireAddress::SocketAddress(tcp.peer_addr()),
                                             id: nsproxy_common::routing::ProxyID::for_file(root.as_path()),
                                         },
@@ -337,12 +337,12 @@ pub async fn main_entry(
 
                 if mgr.is_none() {
                     to_proxy = None;
-                    resolv = VDNSRES::SpecialHandling(TUNResponse::Direct(peeraddr))
+                    resolv = VDNSRES::Opine(RoutingDecision::Direct(peeraddr))
                 } else {
                     resolv = vh.process(udp.peer_addr());
                     to_proxy = match &resolv {
                         VDNSRES::NormalProxying => Some(WireAddress::SocketAddress(udp.peer_addr())),
-                        VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => {
+                        VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => {
                             Some(WireAddress::DomainAddress(host.to_owned(), udp.peer_addr().port()))
                         }
                         _ => None,
@@ -429,14 +429,14 @@ pub async fn main_entry(
                     }
                 } else {
                     match resolv {
-                        VDNSRES::SpecialHandling(TUNResponse::NATByTUN(host)) | VDNSRES::SpecialHandling(TUNResponse::Direct(host)) => {
+                        VDNSRES::Opine(RoutingDecision::NATByTUN(host)) | VDNSRES::Opine(RoutingDecision::Direct(host)) => {
                             info!("UDP protocol: NAT to {}. {:?}", &host, resolv);
                             tokio::spawn(async move {
                                 handle_udp_nat(udp, host).await?;
                                 aok!(())
                             });
                         }
-                        VDNSRES::SpecialHandling(TUNResponse::Files(root)) => {}
+                        VDNSRES::Opine(RoutingDecision::File(_root)) => {}
                         _ => {
                             warn!("Invalid VirtDNS Addr {}", peeraddr);
                         }
