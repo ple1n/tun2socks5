@@ -3,12 +3,14 @@
 
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    dns::{DNSState, TUNResponse, VirtDNSHandle, VDNSRES},
+    dns::{DNSState, VirtDNSHandle},
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
+pub use diag;
+use diag::{next_conn_id, DiagEvent, DiagServer, StreamKind, Timestamp};
 pub use flume;
 use futures::{
     channel::{mpsc, oneshot},
@@ -20,10 +22,11 @@ use ipstack::{
     stream::{tcp::TcpConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream},
     IpStackConfig, TUNDev,
 };
+use nsproxy_common::routing::RoutingDecision;
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
-use socks5_impl::protocol::{WireAddress, UserKey};
+use socks5_impl::protocol::{UserKey, WireAddress};
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
@@ -49,9 +52,6 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 use tun_rs::AsyncDevice;
 use udp_stream::UdpStream;
-pub use diag;
-use diag::{DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
-use nsproxy_common::routing::RoutingDecision;
 pub use {
     args::*,
     error::{Error, Result},
@@ -110,8 +110,14 @@ pub async fn main_entry(
     // Start diag server if socket path is configured
     let diag = if let Some(ref sock_path) = args.diag_sock {
         match DiagServer::start(sock_path.as_path()).await {
-            Ok(srv) => { info!("diag server started at {:?}", sock_path); srv }
-            Err(e) => { warn!("diag server failed to start: {}, continuing without", e); DiagServer::noop() }
+            Ok(srv) => {
+                info!("diag server started at {:?}", sock_path);
+                srv
+            }
+            Err(e) => {
+                warn!("diag server failed to start: {}, continuing without", e);
+                DiagServer::noop()
+            }
         }
     } else {
         DiagServer::noop()
@@ -202,7 +208,9 @@ pub async fn main_entry(
                             }
                             VDNSRES::SpecialHandling(dst) => {
                                 to_proxy = match dst {
-                                    TUNResponse::ProxiedHost(host) => Some(WireAddress::DomainAddress(host.clone(), tcp.peer_addr().port())),
+                                    TUNResponse::ProxiedHost(host) => {
+                                        Some(WireAddress::DomainAddress(host.clone(), tcp.peer_addr().port()))
+                                    }
                                     _ => None,
                                 };
                             }
@@ -225,20 +233,28 @@ pub async fn main_entry(
                         let info = SessionInfo::new(tcp.local_addr(), dst, IpProtocol::Tcp);
                         if let Some(ProxyInst { mgr, server_addr, key }) = mgr.clone() {
                             let proxy_handler = mgr.new_proxy_handler(info.clone(), false).await?;
-                            diag.emit(DiagEvent::Connected { id: conn_id, ts: Timestamp::now() });
+                            diag.emit(DiagEvent::Connected {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                            });
                             if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
                                 // This kind of error causes mid-connection drop.
                                 // An error in TCP is handled by state transition internally.
                                 diag.emit(DiagEvent::Finished {
-                                    id: conn_id, ts: Timestamp::now(),
+                                    id: conn_id,
+                                    ts: Timestamp::now(),
                                     error: Some(format!("{:?}", err)),
-                                    bytes_up: 0, bytes_down: 0,
+                                    bytes_up: 0,
+                                    bytes_down: 0,
                                 });
                                 error!("Conn dropped {} {:?}", info, err);
                             } else {
                                 diag.emit(DiagEvent::Finished {
-                                    id: conn_id, ts: Timestamp::now(),
-                                    error: None, bytes_up: 0, bytes_down: 0,
+                                    id: conn_id,
+                                    ts: Timestamp::now(),
+                                    error: None,
+                                    bytes_up: 0,
+                                    bytes_down: 0,
                                 });
                             }
                         }
@@ -247,35 +263,42 @@ pub async fn main_entry(
                             VDNSRES::SpecialHandling(dst) => match dst {
                                 TUNResponse::NATByTUN(sock) => {
                                     diag.emit(DiagEvent::Route {
-                                        id: conn_id, ts: Timestamp::now(),
+                                        id: conn_id,
+                                        ts: Timestamp::now(),
                                         route: RoutingDecision::NATByTUN(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
-                                            id: conn_id, ts: Timestamp::now(),
+                                            id: conn_id,
+                                            ts: Timestamp::now(),
                                             error: Some(format!("{}", err)),
-                                            bytes_up: 0, bytes_down: 0,
+                                            bytes_up: 0,
+                                            bytes_down: 0,
                                         });
                                         info!("tcp drop {} {}", sock, err);
                                     }
                                 }
                                 TUNResponse::Direct(sock) => {
                                     diag.emit(DiagEvent::Route {
-                                        id: conn_id, ts: Timestamp::now(),
+                                        id: conn_id,
+                                        ts: Timestamp::now(),
                                         route: RoutingDecision::Direct(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
-                                            id: conn_id, ts: Timestamp::now(),
+                                            id: conn_id,
+                                            ts: Timestamp::now(),
                                             error: Some(format!("{}", err)),
-                                            bytes_up: 0, bytes_down: 0,
+                                            bytes_up: 0,
+                                            bytes_down: 0,
                                         });
                                         info!("tcp drop {} {}", sock, err);
                                     }
                                 }
                                 TUNResponse::Files(root) => {
                                     diag.emit(DiagEvent::Route {
-                                        id: conn_id, ts: Timestamp::now(),
+                                        id: conn_id,
+                                        ts: Timestamp::now(),
                                         route: RoutingDecision::Proxy {
                                             target: socks5_impl::protocol::WireAddress::SocketAddress(tcp.peer_addr()),
                                             id: nsproxy_common::routing::ProxyID::for_file(root.as_path()),
@@ -444,7 +467,8 @@ async fn handle_tcp_session(
     server_addr: SocketAddr,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
 ) -> crate::Result<()> {
-    let mut server = TcpStream::connect(server_addr).await
+    let mut server = TcpStream::connect(server_addr)
+        .await
         .map_err(|e| anyhow!("proxy server connection refused at {}: {}", server_addr, e))?;
     // let session_info = proxy_handler.lock().await.get_session_info();
     // debug!("beginning {}", session_info);
@@ -456,13 +480,15 @@ async fn handle_tcp_session(
 
     let res = tokio::try_join!(
         async {
-            let k = tokio::io::copy(&mut t_rx, &mut s_tx).await
+            let k = tokio::io::copy(&mut t_rx, &mut s_tx)
+                .await
                 .map_err(|e| anyhow!("user side closed: {}", e));
             let _ = s_tx.shutdown().await;
             k
         },
         async {
-            let k = tokio::io::copy(&mut s_rx, &mut t_tx).await
+            let k = tokio::io::copy(&mut s_rx, &mut t_tx)
+                .await
                 .map_err(|e| anyhow!("proxy side closed: {}", e));
             let _ = t_tx.shutdown().await;
             k
@@ -523,7 +549,8 @@ async fn handle_udp_associate_session(
     ipv6_enabled: bool,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{StreamOperation, UdpHeader};
-    let mut server = TcpStream::connect(server_addr).await
+    let mut server = TcpStream::connect(server_addr)
+        .await
         .map_err(|e| anyhow!("proxy server connection refused at {}: {}", server_addr, e))?;
     let session_info = proxy_handler.lock().await.get_session_info();
     debug!("{}", session_info);
@@ -595,7 +622,8 @@ async fn handle_dns_over_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     ipv6_enabled: bool,
 ) -> crate::Result<()> {
-    let mut server = TcpStream::connect(server_addr).await
+    let mut server = TcpStream::connect(server_addr)
+        .await
         .map_err(|e| anyhow!("proxy server connection refused at {}: {}", server_addr, e))?;
     let session_info = proxy_handler.lock().await.get_session_info();
     info!("DNS over TCP {}", session_info);

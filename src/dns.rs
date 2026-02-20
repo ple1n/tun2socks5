@@ -4,6 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
+use nsproxy_common::routing::{TUNResponse, VDNSRES};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::{Deserialize, Serialize};
@@ -116,13 +117,6 @@ pub struct DNSState<R: Hash + Eq, L: Hash + Eq> {
     pub subnet: Ipv4Network,
 }
 
-#[derive(Debug)]
-pub enum VDNSRES {
-    SpecialHandling(TUNResponse),
-    NormalProxying,
-    ERR,
-}
-
 pub struct VirtDNSAsync {
     pub subnet: Ipv4Network,
     pub range: RangeInclusive<Ipv4A>,
@@ -220,17 +214,6 @@ impl Lifecycle<Ipv6A, TUNResponse> for Ipv6Eviction {
 struct IPKeyEntry {
     domain: TUNResponse,
     lifetime: Option<PoolEntry>,
-}
-
-#[derive(Clone, Debug)]
-pub enum TUNResponse {
-    ProxiedHost(String),
-    /// Warning. The connection is made by TUN process, which exists in SRC NS.
-    NATByTUN(SocketAddr),
-    Direct(SocketAddr),
-    Files(PathBuf),
-    /// When the user has properly configured routing
-    Unreachable
 }
 
 const LRU: usize = 16384;
