@@ -110,7 +110,7 @@ pub async fn main_entry(
     // Start diag server if socket path is configured
     let diag = if let Some(ref sock_path) = args.diag_sock {
         match DiagServer::start(sock_path.as_path()).await {
-            Ok(srv) => {
+            Ok((srv, _cmd_rx)) => {
                 info!("diag server started at {:?}", sock_path);
                 srv
             }
