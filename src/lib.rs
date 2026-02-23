@@ -55,7 +55,6 @@ use udp_stream::UdpStream;
 pub use {
     args::*,
     error::{Error, Result},
-    route_config::{config_restore, config_settings, DEFAULT_GATEWAY, TUN_DNS, TUN_GATEWAY, TUN_IPV4, TUN_NETMASK},
 };
 
 mod args;
@@ -65,7 +64,6 @@ pub mod error;
 pub mod http;
 mod private_ip;
 pub mod proxy_handler;
-mod route_config;
 pub mod session_info;
 pub mod socks;
 

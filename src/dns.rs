@@ -265,15 +265,20 @@ fn test_uniset() {
     println!("{:?}", k);
 }
 
-pub static VIRT_IP: &str = "fc00::/7";
+pub static VIRT_IP6_NET: &str = "fc00::/7";
 
-pub fn default_virtip() -> Ipv6Network {
-    VIRT_IP.parse().unwrap()
+/// Default virtual IPv4 subnet for DNS-based IP allocation.
+pub static VIRT_SUBNET4: &str = "198.18.0.0/16";
+/// Default IPv4 address assigned to the TUN interface (first host in `VIRT_SUBNET4`).
+pub static VIRT_TUN_IP4: &str = "198.18.0.1/16";
+
+pub fn default_virtip6_net() -> Ipv6Network {
+    VIRT_IP6_NET.parse().unwrap()
 }
 
 impl VirtDNSAsync {
     pub fn default(host_cap: usize) -> Result<Self> {
-        let subnet: Ipv4Network = "198.18.0.0/16".parse()?;
+        let subnet: Ipv4Network = VIRT_SUBNET4.parse()?;
         assert!(host_cap < subnet.size() as usize);
         let range = subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
@@ -286,7 +291,7 @@ impl VirtDNSAsync {
         let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
-                subnet6: default_virtip(),
+                subnet6: default_virtip6_net(),
                 aaaa_only: false,
                 f_domain: Arc::new(Cache::with(
                     LRU,
