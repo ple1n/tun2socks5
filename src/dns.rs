@@ -4,7 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use index_set::{SharedBitSet, slot_count};
+use index_set::{AtomicBitSet, SharedBitSet, slot_count};
 use nsproxy_common::routing::{DropReason, RoutingDecision, VDNSRES};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
@@ -141,6 +141,7 @@ pub struct VirtDNSHandle {
     range: RangeInclusive<Ipv4A>,
     evicted: EvictedQ,
     pub aaaa_only: bool,
+    v4_set: Arc<AtomicBitSet<{ slot_count::from_bits(2 ^ 16) }>>,
 }
 
 #[derive(Clone)]
@@ -249,6 +250,7 @@ fn test_uniset() {
     set.remove(1);
     let k = set.set_next_free_bit();
     println!("{:?}", k);
+    
 }
 
 pub static VIRT_IP: &str = "fc00::/7";
