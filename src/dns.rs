@@ -4,6 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
+use index_set::{SharedBitSet, slot_count};
 use nsproxy_common::routing::{DropReason, RoutingDecision, VDNSRES};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
@@ -20,7 +21,6 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 use std::{net::IpAddr, str::FromStr};
-use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{info, trace, warn};
 use trust_dns_proto::op::MessageType;
@@ -137,7 +137,7 @@ pub struct VirtDNSHandle {
     ip6: Arc<Cache<Ipv6A, RoutingDecision, UnitWeighter, DefaultHashBuilder, Ipv6Eviction>>,
     pub subnet6: Ipv6Network,
     f_domain: Arc<Cache<String, DomainEntry, UnitWeighter, DefaultHashBuilder, IPEviction>>,
-    alloc: lock_alloc::Alloc<Ipv4A>,
+    alloc_v4: lock_alloc::Alloc<Ipv4A>,
     range: RangeInclusive<Ipv4A>,
     evicted: EvictedQ,
     pub aaaa_only: bool,
@@ -241,6 +241,16 @@ fn test_hash() {
     println!("hash, {}", hash);
 }
 
+#[test]
+fn test_uniset() {
+    let set: index_set::AtomicBitSet<{ slot_count::from_bits(2 ^ 24) }> = index_set::AtomicBitSet::new();
+    let k = set.set_next_free_bit();
+    let k = set.set_next_free_bit();
+    set.remove(1);
+    let k = set.set_next_free_bit();
+    println!("{:?}", k);
+}
+
 pub static VIRT_IP: &str = "fc00::/7";
 
 pub fn default_virtip() -> Ipv6Network {
@@ -257,9 +267,8 @@ impl VirtDNSAsync {
         let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
-                subnet6: default_virtip() ,
+                subnet6: default_virtip(),
                 aaaa_only: true,
-
                 f_domain: Arc::new(Cache::with(
                     LRU,
                     LRU as u64,
@@ -276,7 +285,7 @@ impl VirtDNSAsync {
                 )),
                 evicted: ev,
                 f_ip: concmap,
-                alloc: Alloc::init(
+                alloc_v4: Alloc::init(
                     Ipv4A {
                         addr: subnet.ip(),
                         host: 16,
@@ -329,17 +338,17 @@ impl VirtDNSHandle {
         if let Some(hit) = self.f_domain.get(&dom) {
             return Ok(hit.addr());
         }
-        
+
         trace!("virtdns: alloc {}", dom);
-        
+
         // Slow path: allocate new entry and apply evictions
         let own = Arc::new(PoolEntryT {
-            lock: self.alloc.pool.clone().get_rc(),
+            lock: self.alloc_v4.pool.clone().get_rc(),
             pinned: false,
         });
         let addr = own.lock.addr;
         let ip_key = *own.lock;
-        
+
         // Insert both mappings before eviction to ensure atomicity
         self.f_domain.insert(dom.clone(), DomainEntry::Pool(own.clone()));
         self.f_ip.insert(
@@ -349,10 +358,10 @@ impl VirtDNSHandle {
                 lifetime: own.into(),
             },
         );
-        
+
         // Apply evictions after successful allocation
         self.apply_evictions();
-        
+
         Ok(addr)
     }
     pub fn apply_evictions(&self) {
@@ -369,7 +378,7 @@ impl VirtDNSHandle {
     pub fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         let message = parse_data_to_dns_message(data, false)?;
         let qname = extract_domain_from_dns_message(&message)?;
-        
+
         if self.aaaa_only {
             if let Some(hit) = self.f_domain.get(&qname) {
                 let addr = hit.addr();
@@ -399,12 +408,12 @@ impl VirtDNSHandle {
             SocketAddr::V4(v4) => {
                 let ip = v4.ip().to_owned();
                 let v4a = self.ipv4a(ip);
-                
+
                 // Fast path: check range first to avoid map lookup for non-virtual IPs
                 if !self.range.contains(&ip.into()) {
                     return VDNSRES::NormalProxying;
                 }
-                
+
                 // Lookup in map
                 if let Some(IPKeyEntry { domain, .. }) = self.f_ip.get(&v4a) {
                     VDNSRES::Opine(domain)
@@ -415,12 +424,12 @@ impl VirtDNSHandle {
             }
             SocketAddr::V6(v6) => {
                 let ip = v6.ip().to_owned();
-                
+
                 // Fast path: check subnet first
                 if !self.subnet6.contains(ip) {
                     return VDNSRES::NormalProxying;
                 }
-                
+
                 let v6a = self.ipv6a(ip);
                 if let Some(h) = self.ip6.get(&v6a) {
                     VDNSRES::Opine(h)
@@ -432,7 +441,7 @@ impl VirtDNSHandle {
         }
     }
     pub fn ipv4a(&self, ip: Ipv4Addr) -> Ipv4A {
-        Ipv4A::new(ip, self.alloc.interval.host)
+        Ipv4A::new(ip, self.alloc_v4.interval.host)
     }
     pub fn ipv6a(&self, ip: Ipv6Addr) -> Ipv6A {
         Ipv6A::new(ip, 128 - 7)
@@ -462,7 +471,7 @@ impl VirtDNSHandle {
             self.f_domain.insert(dom, DomainEntry::Pinned(v4a));
         } else {
             let own = Arc::new(PoolEntryT {
-                lock: self.alloc.pool.clone().get_rc(),
+                lock: self.alloc_v4.pool.clone().get_rc(),
                 pinned: false,
             });
             trace!("got object from pool");
