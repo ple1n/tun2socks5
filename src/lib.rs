@@ -201,7 +201,7 @@ pub async fn main_entry(
                     let mut to_proxy;
                     if mgr.is_some() {
                         to_proxy = Some(WireAddress::SocketAddress(tcp.peer_addr()));
-                        vdrs = vh.process(tcp.peer_addr());
+                        vdrs = vh.preprocess(tcp.peer_addr());
                         match &vdrs {
                             VDNSRES::ERR => {
                                 warn!("Invalid VirtDNS Addr {}", tcp.peer_addr());
@@ -339,7 +339,7 @@ pub async fn main_entry(
                     to_proxy = None;
                     resolv = VDNSRES::Opine(RoutingDecision::Direct(peeraddr))
                 } else {
-                    resolv = vh.process(udp.peer_addr());
+                    resolv = vh.preprocess(udp.peer_addr());
                     to_proxy = match &resolv {
                         VDNSRES::NormalProxying => Some(WireAddress::SocketAddress(udp.peer_addr())),
                         VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => {

@@ -4,7 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use index_set::{AtomicBitSet, SharedBitSet, slot_count};
+use index_set::{slot_count, AtomicBitSet, SharedBitSet};
 use nsproxy_common::routing::{DropReason, RoutingDecision, VDNSRES};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
@@ -125,6 +125,7 @@ pub struct VirtDNSAsync {
 
 type PoolEntry = Arc<PoolEntryT>;
 type EvictedQ = Arc<SegQueue<Ipv4A>>;
+type V4BitSet = Arc<AtomicBitSet<{ slot_count::from_bits(2 ^ 16) }>>;
 
 pub struct PoolEntryT {
     pub lock: RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>,
@@ -148,6 +149,8 @@ pub struct VirtDNSHandle {
 pub enum DomainEntry {
     Pool(PoolEntry),
     Pinned(Ipv4A),
+    /// Allocated from the atomic bitset; freed on LRU eviction.
+    BitSet(Ipv4A),
 }
 
 impl DomainEntry {
@@ -158,6 +161,7 @@ impl DomainEntry {
         match self {
             DomainEntry::Pinned(val) => *val,
             DomainEntry::Pool(val) => *val.lock,
+            DomainEntry::BitSet(val) => *val,
         }
     }
 }
@@ -166,18 +170,22 @@ impl DomainEntry {
 /// Eviction is depedent on LRU(domain -> IP)
 struct IPEviction {
     evicted: EvictedQ,
+    /// Shared bitset for BitSet-variant entries; base is the subnet network address.
+    v4_set: V4BitSet,
+    v4_base: u32,
 }
 
 impl Lifecycle<String, DomainEntry> for IPEviction {
     type RequestState = ();
-    fn is_pinned(&self, key: &String, val: &DomainEntry) -> bool {
+    fn is_pinned(&self, _key: &String, val: &DomainEntry) -> bool {
         match val {
             DomainEntry::Pinned(_) => true,
             DomainEntry::Pool(p) => p.pinned,
+            DomainEntry::BitSet(_) => false,
         }
     }
     fn begin_request(&self) -> Self::RequestState {}
-    fn on_evict(&self, state: &mut Self::RequestState, key: String, val: DomainEntry) {
+    fn on_evict(&self, _state: &mut Self::RequestState, key: String, val: DomainEntry) {
         match val {
             DomainEntry::Pinned(ip) => {
                 warn!("evicting pinned {}", ip.addr);
@@ -185,6 +193,11 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
             DomainEntry::Pool(val) => {
                 info!("evict {} -> {:?}", key, val.lock);
                 self.evicted.push(*val.lock);
+            }
+            DomainEntry::BitSet(v4a) => {
+                let idx = (u32::from(v4a.addr) - self.v4_base) as usize;
+                info!("evict bitset {} -> {} (bit {})", key, v4a.addr, idx);
+                self.v4_set.remove(idx);
             }
         }
     }
@@ -250,7 +263,6 @@ fn test_uniset() {
     set.remove(1);
     let k = set.set_next_free_bit();
     println!("{:?}", k);
-    
 }
 
 pub static VIRT_IP: &str = "fc00::/7";
@@ -266,17 +278,25 @@ impl VirtDNSAsync {
         let range = subnet.range(0);
         let concmap: ConcurrentMap<Ipv4A, IPKeyEntry> = Default::default();
         let ev: Arc<SegQueue<Ipv4A>> = Default::default();
+        let mut v4_set: V4BitSet = Arc::new(AtomicBitSet::new());
+        let v4_base = u32::from(subnet.ip());
+        v4_set.set_next_free_bit();
+        v4_set.set_next_free_bit();
         let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
                 subnet6: default_virtip(),
-                aaaa_only: true,
+                aaaa_only: false,
                 f_domain: Arc::new(Cache::with(
                     LRU,
                     LRU as u64,
                     UnitWeighter,
                     DefaultHashBuilder::default(),
-                    IPEviction { evicted: ev.clone() },
+                    IPEviction {
+                        evicted: ev.clone(),
+                        v4_set: v4_set.clone(),
+                        v4_base,
+                    },
                 )),
                 ip6: Arc::new(Cache::with(
                     LRU_IPV6,
@@ -295,6 +315,7 @@ impl VirtDNSAsync {
                     host_cap as usize,
                 ),
                 range,
+                v4_set,
             },
             subnet,
         };
@@ -335,7 +356,7 @@ impl VirtDNSHandle {
         // });
     }
     #[inline]
-    pub fn to_respond_in_dns(&self, dom: String) -> Result<Ipv4Addr> {
+    pub fn respond_by_pool(&self, dom: String) -> Result<Ipv4Addr> {
         // Fast path: check cache first without evictions
         if let Some(hit) = self.f_domain.get(&dom) {
             return Ok(hit.addr());
@@ -376,36 +397,93 @@ impl VirtDNSHandle {
             }
         }
     }
+
+    /// Allocate a virtual IPv4 from the atomic bitset.
+    ///
+    /// Claims the next free bit in `v4_set`, then reconstructs the IPv4 by
+    /// OR-ing the bit index (host part) with the network base taken from
+    /// `self.range`. Returns `None` when the pool is exhausted.
+    #[inline]
+    pub fn alloc_bitset(&self) -> Option<Ipv4Addr> {
+        let idx = self.v4_set.set_next_free_bit()?;
+        let base = u32::from(self.range.start().addr);
+        Some(Ipv4Addr::from(base | idx as u32))
+    }
+
+    /// Release a bitset-allocated virtual IPv4 back to the pool.
+    ///
+    /// Recovers the host-part index by subtracting the network base, then
+    /// clears the corresponding bit in `v4_set`.
+    #[inline]
+    pub fn dealloc_bitset(&self, ip: Ipv4Addr) {
+        let base = u32::from(self.range.start().addr);
+        let idx = (u32::from(ip) - base) as usize;
+        self.v4_set.remove(idx);
+    }
+
+    /// Respond to an A query using the atomic bitset allocator.
+    ///
+    /// On cache hit the existing address is reused. On miss a bit is claimed
+    /// from `v4_set`, the domain→IP and IP→domain mappings are inserted, and
+    /// the new address is returned. Pool is exhausted when all 2^16 bits are
+    /// set.
+    #[inline]
+    pub fn respond_by_bitset(&self, dom: String) -> Result<Ipv4Addr> {
+        // Fast path: domain already has a virtual IP
+        if let Some(hit) = self.f_domain.get(&dom) {
+            return Ok(hit.addr());
+        }
+
+        trace!("virtdns bitset: alloc {}", dom);
+
+        let ip = self.alloc_bitset().ok_or_else(|| anyhow!("virtual IPv4 pool exhausted"))?;
+        let v4a = self.ipv4a(ip);
+
+        self.f_domain.insert(dom.clone(), DomainEntry::BitSet(v4a));
+        self.f_ip.insert(
+            v4a,
+            IPKeyEntry {
+                domain: RoutingDecision::HostOverProxy(dom),
+                lifetime: None,
+            },
+        );
+
+        Ok(ip)
+    }
+
     #[inline]
     pub fn receive_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         let message = parse_data_to_dns_message(data, false)?;
-        let qname = extract_domain_from_dns_message(&message)?;
-
-        if self.aaaa_only {
-            if let Some(hit) = self.f_domain.get(&qname) {
-                let addr = hit.addr();
-                let message = build_dns_response(message, &qname, addr.into(), 5)?;
-                return Ok(message.to_vec()?);
-            }
-
-            // IPv6 address is deterministic from the domain name
+        let query = message.queries().get(0).ok_or(anyhow!("DnsRequest no query body"))?;
+        let qname = query.name().to_string();
+        let qtype = query.query_type();
+        if matches!(qtype, RecordType::AAAA) || self.aaaa_only {
+            // AAAA: deterministic hash-based IPv6 — no allocation needed, O(1)
             let ip = self.domain_to_ipv6(&qname);
             let ipa = self.ipv6a(ip);
-
             if self.ip6.get(&ipa).is_none() {
                 self.ip6.insert(ipa, RoutingDecision::HostOverProxy(qname.clone()));
             }
-
             let message = build_dns_response(message, &qname, ip.into(), 5)?;
             Ok(message.to_vec()?)
         } else {
-            let ip = self.to_respond_in_dns(qname.clone())?;
-            let message = build_dns_response(message, &qname, ip.into(), 5)?;
-            Ok(message.to_vec()?)
+            match qtype {
+                RecordType::A => {
+                    // A: bitset-allocated virtual IPv4
+                    let ip = self.respond_by_bitset(qname.clone())?;
+                    let message = build_dns_response(message, &qname, ip.into(), 5)?;
+                    Ok(message.to_vec()?)
+                }
+                _ => {
+                    let ip = self.respond_by_bitset(qname.clone())?;
+                    let message = build_dns_response(message, &qname, ip.into(), 5)?;
+                    Ok(message.to_vec()?)
+                }
+            }
         }
     }
     #[inline]
-    pub fn process(&self, addr: SocketAddr) -> VDNSRES {
+    pub fn preprocess(&self, addr: SocketAddr) -> VDNSRES {
         match addr {
             SocketAddr::V4(v4) => {
                 let ip = v4.ip().to_owned();

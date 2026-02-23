@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
             let mut rng = rand::thread_rng();
             loop {
                 let n = rng.gen_range(0..1024);
-                let al = hd.to_respond_in_dns(n.to_string()).await?;
+                let al = hd.respond_by_pool(n.to_string()).await?;
                 println!("alloc {}", al);
                 let slp = rng.gen_range(0..128);
                 let slp = Duration::from_millis(slp);
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
             loop {
                 let n = rng.gen_range(0..1024);
                 let ip = SocketAddr::V4(SocketAddrV4::new(subnet.nth(n).unwrap(), 0));
-                let x = hd.process(ip).await;
+                let x = hd.preprocess(ip).await;
                 println!("{} -> {:?}", &ip, x);
                 let slp = rng.gen_range(0..128);
                 let slp = Duration::from_millis(slp);
