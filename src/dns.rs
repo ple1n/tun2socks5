@@ -4,7 +4,7 @@ use crossbeam::queue::{ArrayQueue, SegQueue};
 use futures::{FutureExt, SinkExt, StreamExt};
 use id_alloc::lock_alloc::Alloc;
 use id_alloc::opool::RcGuard;
-use index_set::{slot_count, AtomicBitSet, SharedBitSet};
+use index_set::{slot_count, AtomicBitSet, BitSet, SharedBitSet};
 use nsproxy_common::routing::{DropReason, RoutingDecision, VDNSRES};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
@@ -125,7 +125,7 @@ pub struct VirtDNSAsync {
 
 type PoolEntry = Arc<PoolEntryT>;
 type EvictedQ = Arc<SegQueue<Ipv4A>>;
-type V4BitSet = Arc<AtomicBitSet<{ slot_count::from_bits(2 ^ 16) }>>;
+type V4BitSet = Arc<AtomicBitSet<{ slot_count::from_kilobytes(64) }>>;
 
 pub struct PoolEntryT {
     pub lock: RcGuard<lock_alloc::Allocator<Ipv4A>, Ipv4A>,
@@ -142,7 +142,7 @@ pub struct VirtDNSHandle {
     range: RangeInclusive<Ipv4A>,
     evicted: EvictedQ,
     pub aaaa_only: bool,
-    v4_set: Arc<AtomicBitSet<{ slot_count::from_bits(2 ^ 16) }>>,
+    v4_set: V4BitSet,
 }
 
 #[derive(Clone)]
@@ -282,6 +282,7 @@ impl VirtDNSAsync {
         let v4_base = u32::from(subnet.ip());
         v4_set.set_next_free_bit();
         v4_set.set_next_free_bit();
+        info!("virtual IPV4 {}", v4_set.capacity());
         let virt = Self {
             range: range.clone(),
             handle: VirtDNSHandle {
