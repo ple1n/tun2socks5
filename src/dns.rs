@@ -145,6 +145,14 @@ pub struct VirtDNSHandle {
     v4_set: V4BitSet,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VirtDnsStats {
+    pub aaaa_only: bool,
+    pub domain_count: usize,
+    pub ip4_count: usize,
+    pub ip6_count: usize,
+}
+
 #[derive(Clone)]
 pub enum DomainEntry {
     Pool(PoolEntry),
@@ -351,6 +359,15 @@ impl VirtDNSHandle {
         let combined = truncated | network_bits;
 
         Ipv6Addr::from_bits(combined)
+    }
+
+    pub fn stats(&self) -> VirtDnsStats {
+        VirtDnsStats {
+            aaaa_only: self.aaaa_only,
+            domain_count: self.f_domain.len(),
+            ip4_count: self.f_ip.len(),
+            ip6_count: self.ip6.len(),
+        }
     }
 
     pub async fn periodic_report(self) {
