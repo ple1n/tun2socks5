@@ -242,8 +242,8 @@ pub async fn main_entry(
                                     id: conn_id,
                                     ts: Timestamp::now(),
                                     error: Some(format!("{:?}", err)),
-                                    bytes_up: 0,
-                                    bytes_down: 0,
+                                    bytes_up: 0.0,
+                                    bytes_down: 0.0,
                                 });
                                 error!("Conn dropped {} {:?}", info, err);
                             } else {
@@ -251,8 +251,8 @@ pub async fn main_entry(
                                     id: conn_id,
                                     ts: Timestamp::now(),
                                     error: None,
-                                    bytes_up: 0,
-                                    bytes_down: 0,
+                                    bytes_up: 0.0,
+                                    bytes_down: 0.0,
                                 });
                             }
                         }
@@ -270,8 +270,8 @@ pub async fn main_entry(
                                             id: conn_id,
                                             ts: Timestamp::now(),
                                             error: Some(format!("{}", err)),
-                                            bytes_up: 0,
-                                            bytes_down: 0,
+                                            bytes_up: 0.0,
+                                            bytes_down: 0.0,
                                         });
                                         info!("tcp drop {} {}", sock, err);
                                     }
@@ -287,8 +287,8 @@ pub async fn main_entry(
                                             id: conn_id,
                                             ts: Timestamp::now(),
                                             error: Some(format!("{}", err)),
-                                            bytes_up: 0,
-                                            bytes_down: 0,
+                                            bytes_up: 0.0,
+                                            bytes_down: 0.0,
                                         });
                                         info!("tcp drop {} {}", sock, err);
                                     }
