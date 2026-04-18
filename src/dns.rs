@@ -592,6 +592,13 @@ impl VirtDNSHandle {
         Ok(())
     }
     pub fn unpin(&self, dom: String) {
-        todo!()
+        self.apply_evictions();
+        if let Some((_domain, entry)) = self.f_domain.remove(&dom) {
+            let addr = entry.addr_a();
+            self.f_ip.remove(&addr);
+            if let DomainEntry::BitSet(v4a) = entry {
+                self.dealloc_bitset(v4a.addr);
+            }
+        }
     }
 }
