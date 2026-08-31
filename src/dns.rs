@@ -492,8 +492,15 @@ impl VirtDNSHandle {
         } else {
             match qtype {
                 RecordType::A => {
-                    // A: bitset-allocated virtual IPv4
-                    let ip = self.respond_by_bitset(qname.clone())?;
+                    let pinned = self
+                        .f_domain
+                        .get(&qname)
+                        .or_else(|| self.f_domain.get(qname.trim_end_matches('.')))
+                        .map(|entry| entry.addr());
+                    let ip = match pinned {
+                        Some(ip) => ip,
+                        None => self.respond_by_bitset(qname.clone())?,
+                    };
                     let message = build_dns_response(message, &qname, ip.into(), 5)?;
                     Ok(message.to_vec()?)
                 }
