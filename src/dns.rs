@@ -194,6 +194,8 @@ impl Lifecycle<String, DomainEntry> for IPEviction {
     }
     fn begin_request(&self) -> Self::RequestState {}
     fn on_evict(&self, _state: &mut Self::RequestState, key: String, val: DomainEntry) {
+        let ip = val.addr();
+        diag::history::record_mapping_end(IpAddr::V4(ip), &key, diag::Timestamp::now());
         match val {
             DomainEntry::Pinned(ip) => {
                 warn!("evicting pinned {}", ip.addr);
@@ -222,6 +224,9 @@ impl Lifecycle<Ipv6A, RoutingDecision> for Ipv6Eviction {
     }
     fn begin_request(&self) -> Self::RequestState {}
     fn on_evict(&self, _state: &mut Self::RequestState, key: Ipv6A, val: RoutingDecision) {
+        if let RoutingDecision::HostOverProxy(domain) = &val {
+            diag::history::record_mapping_end(IpAddr::V6(key.addr), domain, diag::Timestamp::now());
+        }
         info!("evict ipv6 {:?} -> {:?}", key, val);
     }
 }
@@ -397,6 +402,11 @@ impl VirtDNSHandle {
 
         // Insert both mappings before eviction to ensure atomicity
         self.f_domain.insert(dom.clone(), DomainEntry::Pool(own.clone()));
+        diag::history::record_mapping_start(
+            IpAddr::V4(addr),
+            &dom,
+            diag::Timestamp::now(),
+        );
         self.f_ip.insert(
             ip_key,
             IPKeyEntry {
@@ -463,6 +473,11 @@ impl VirtDNSHandle {
         let v4a = self.ipv4a(ip);
 
         self.f_domain.insert(dom.clone(), DomainEntry::BitSet(v4a));
+        diag::history::record_mapping_start(
+            IpAddr::V4(ip),
+            &dom,
+            diag::Timestamp::now(),
+        );
         self.f_ip.insert(
             v4a,
             IPKeyEntry {
@@ -486,6 +501,11 @@ impl VirtDNSHandle {
             let ipa = self.ipv6a(ip);
             if self.ip6.get(&ipa).is_none() {
                 self.ip6.insert(ipa, RoutingDecision::HostOverProxy(qname.clone()));
+                diag::history::record_mapping_start(
+                    IpAddr::V6(ip),
+                    &qname,
+                    diag::Timestamp::now(),
+                );
             }
             let message = build_dns_response(message, &qname, ip.into(), 5)?;
             Ok(message.to_vec()?)
@@ -578,7 +598,12 @@ impl VirtDNSHandle {
                     lifetime: None,
                 },
             );
-            self.f_domain.insert(dom, DomainEntry::Pinned(v4a));
+            self.f_domain.insert(dom.clone(), DomainEntry::Pinned(v4a));
+            diag::history::record_mapping_start(
+                IpAddr::V4(v4),
+                &dom,
+                diag::Timestamp::now(),
+            );
         } else {
             let own = Arc::new(PoolEntryT {
                 lock: self.alloc_v4.pool.clone().get_rc(),
@@ -593,6 +618,11 @@ impl VirtDNSHandle {
                     lifetime: own.clone().into(),
                 },
             );
+            diag::history::record_mapping_start(
+                IpAddr::V4(addr),
+                &dom,
+                diag::Timestamp::now(),
+            );
             self.f_domain.insert(dom, DomainEntry::Pool(own));
         };
 
@@ -602,6 +632,11 @@ impl VirtDNSHandle {
         self.apply_evictions();
         if let Some((_domain, entry)) = self.f_domain.remove(&dom) {
             let addr = entry.addr_a();
+            diag::history::record_mapping_end(
+                IpAddr::V4(addr.addr),
+                &dom,
+                diag::Timestamp::now(),
+            );
             self.f_ip.remove(&addr);
             if let DomainEntry::BitSet(v4a) = entry {
                 self.dealloc_bitset(v4a.addr);
