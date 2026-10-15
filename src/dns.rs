@@ -52,6 +52,8 @@ pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u
     Ok(request)
 }
 
+const VIRTUAL_DNS_TTL_SECS: u32 = 300;
+
 pub fn remove_ipv6_entries(message: &mut Message) {
     message
         .answers_mut()
@@ -507,7 +509,8 @@ impl VirtDNSHandle {
                     diag::Timestamp::now(),
                 );
             }
-            let message = build_dns_response(message, &qname, ip.into(), 5)?;
+            let message =
+                build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
             Ok(message.to_vec()?)
         } else {
             match qtype {
@@ -521,12 +524,14 @@ impl VirtDNSHandle {
                         Some(ip) => ip,
                         None => self.respond_by_bitset(qname.clone())?,
                     };
-                    let message = build_dns_response(message, &qname, ip.into(), 5)?;
+                    let message =
+                        build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
                     Ok(message.to_vec()?)
                 }
                 _ => {
                     let ip = self.respond_by_bitset(qname.clone())?;
-                    let message = build_dns_response(message, &qname, ip.into(), 5)?;
+                    let message =
+                        build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
                     Ok(message.to_vec()?)
                 }
             }
@@ -642,5 +647,30 @@ impl VirtDNSHandle {
                 self.dealloc_bitset(v4a.addr);
             }
         }
+    }
+}
+
+#[test]
+fn virtual_dns_answers_have_a_cacheable_ttl() {
+    use trust_dns_proto::op::Query;
+
+    let virt = VirtDNSAsync::default(POOL_SIZE).unwrap();
+    for record_type in [RecordType::A, RecordType::AAAA] {
+        let mut query = Message::new();
+        query.add_query(Query::query(
+            Name::from_str("dnf.example.").unwrap(),
+            record_type,
+        ));
+        let response = virt
+            .handle
+            .receive_query(&query.to_vec().unwrap())
+            .unwrap();
+        let response = parse_data_to_dns_message(&response, false).unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        assert_eq!(
+            response.answers().first().unwrap().ttl(),
+            VIRTUAL_DNS_TTL_SECS
+        );
     }
 }
