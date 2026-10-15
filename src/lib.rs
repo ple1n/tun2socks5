@@ -215,7 +215,7 @@ pub async fn main_entry(
                             VDNSRES::NormalProxying => to_proxy = Some(WireAddress::SocketAddress(tcp.peer_addr())),
                         }
                     } else {
-                        vdrs = VDNSRES::Opine(RoutingDecision::Direct(tcp.peer_addr()));
+                        vdrs = VDNSRES::Opine(RoutingDecision::NoProxy(tcp.peer_addr()));
                         to_proxy = None;
                     }
 
@@ -276,11 +276,11 @@ pub async fn main_entry(
                                         info!("tcp drop {} {}", sock, err);
                                     }
                                 }
-                                RoutingDecision::Direct(sock) => {
+                                RoutingDecision::NoProxy(sock) => {
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id,
                                         ts: Timestamp::now(),
-                                        route: RoutingResovled::Direct(sock),
+                                        route: RoutingResovled::NoProxy(sock),
                                     });
                                     if let Err(err) = handle_tcp_nat(tcp, sock).await {
                                         diag.emit(DiagEvent::Finished {
@@ -335,7 +335,7 @@ pub async fn main_entry(
 
                 if mgr.is_none() {
                     to_proxy = None;
-                    resolv = VDNSRES::Opine(RoutingDecision::Direct(peeraddr))
+                    resolv = VDNSRES::Opine(RoutingDecision::NoProxy(peeraddr))
                 } else {
                     resolv = vh.preprocess(udp.peer_addr());
                     to_proxy = match &resolv {
@@ -427,7 +427,7 @@ pub async fn main_entry(
                     }
                 } else {
                     match resolv {
-                        VDNSRES::Opine(RoutingDecision::NATByTUN(host)) | VDNSRES::Opine(RoutingDecision::Direct(host)) => {
+                        VDNSRES::Opine(RoutingDecision::NATByTUN(host)) | VDNSRES::Opine(RoutingDecision::NoProxy(host)) => {
                             info!("UDP protocol: NAT to {}. {:?}", &host, resolv);
                             tokio::spawn(async move {
                                 handle_udp_nat(udp, host).await?;
