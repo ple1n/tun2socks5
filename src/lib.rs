@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
 pub use diag;
-use diag::{next_conn_id, DiagEvent, DiagServer, StreamKind, Timestamp};
+use diag::{next_conn_id, ConnId, DiagEvent, DiagServer, StreamKind, Timestamp};
 pub use flume;
 use futures::{
     channel::{mpsc, oneshot},
@@ -22,7 +22,13 @@ use ipstack::{
     stream::{tcp::TcpConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream},
     IpStackConfig, TUNDev,
 };
-use nsproxy_common::routing::{DropReason, RoutingDecision, RoutingResovled, VDNSRES};
+use nsproxy_common::{
+    routing::{DropReason, RoutingDecision, RoutingResovled, VDNSRES},
+    stats::{
+        HostRouteKey, HostRouteMetric, HostRouteStats, ObservedRoute, TransferRateSample,
+        TransferRateTracker,
+    },
+};
 use nsproxy_common::{forever, rpc::FromClient};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
@@ -40,7 +46,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpSocket, TcpStream},
     signal::unix::SignalKind,
     sync::{
@@ -71,6 +77,9 @@ pub use ipstack;
 pub use tun_rs;
 
 const DNS_PORT: u16 = 53;
+const MAX_HOST_ROUTE_STATS: usize = 16_384;
+
+type HostRouteStatsMap = Arc<Mutex<HashMap<HostRouteKey, HostRouteStats>>>;
 
 static TASK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::atomic::Ordering::Relaxed;
@@ -106,20 +115,47 @@ pub async fn main_entry(
     st_sx: flume::Sender<(PathBuf, IpStackTcpStream)>,
 ) -> crate::Result<()> {
     // Start diag server if socket path is configured
-    let diag = if let Some(ref sock_path) = args.diag_sock {
+    let (diag, diag_commands) = if let Some(ref sock_path) = args.diag_sock {
         match DiagServer::start(sock_path.as_path(), diag::DEFAULT_CONN_PERSIST).await {
-            Ok((srv, _cmd_rx)) => {
+            Ok((srv, cmd_rx)) => {
                 info!("diag server started at {:?}", sock_path);
-                srv
+                (srv, Some(cmd_rx))
             }
             Err(e) => {
                 warn!("diag server failed to start: {}, continuing without", e);
-                DiagServer::noop()
+                (DiagServer::noop(), None)
             }
         }
     } else {
-        DiagServer::noop()
+        (DiagServer::noop(), None)
     };
+    let host_route_stats: HostRouteStatsMap = Arc::new(Mutex::new(HashMap::new()));
+    if let Some(mut commands) = diag_commands {
+        let diag = diag.clone();
+        let host_route_stats = host_route_stats.clone();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    diag::ControlCommand::QueryHostRouteStats => {
+                        let ts = Timestamp::now();
+                        let mut stats = {
+                            let host_route_stats = host_route_stats.lock().await;
+                            host_route_stats
+                                .iter()
+                                .map(|(key, value)| value.metric(key.clone(), ts))
+                                .collect::<Vec<_>>()
+                        };
+                        stats.sort_by_key(|metric| metric.key.clone());
+                        diag.emit(DiagEvent::HostRouteStatsSnapshot { ts, stats });
+                    }
+                    command => warn!(
+                        command = ?command,
+                        "unsupported diagnostic command in TUN NAT mode"
+                    ),
+                }
+            }
+        });
+    }
     use dns::VirtDNSAsync as VirtDNS;
 
     let dns_addr = args.dns_addr;
@@ -179,6 +215,7 @@ pub async fn main_entry(
         });
         let body_start = Instant::now();
         let stream_sx = st_sx.clone();
+        let host_route_stats = host_route_stats.clone();
         let iter_conn_id;
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {
@@ -259,38 +296,50 @@ pub async fn main_entry(
                     } else {
                         match vdrs {
                             VDNSRES::Opine(dst) => match dst {
-                                RoutingDecision::NATByTUN(sock) => {
+                                dst @ RoutingDecision::NATByTUN(sock)
+                                | dst @ RoutingDecision::NoProxy(sock) => {
+                                    let route = match dst {
+                                        RoutingDecision::NATByTUN(_) => {
+                                            RoutingResovled::NATByTUN(sock)
+                                        }
+                                        RoutingDecision::NoProxy(_) => {
+                                            RoutingResovled::NoProxy(sock)
+                                        }
+                                        _ => unreachable!(),
+                                    };
                                     diag.emit(DiagEvent::Route {
                                         id: conn_id,
                                         ts: Timestamp::now(),
-                                        route: RoutingResovled::NATByTUN(sock),
+                                        route,
                                     });
-                                    if let Err(err) = handle_tcp_nat(tcp, sock).await {
-                                        diag.emit(DiagEvent::Finished {
-                                            id: conn_id,
-                                            ts: Timestamp::now(),
-                                            error: Some(format!("{}", err)),
-                                            bytes_up: 0.0,
-                                            bytes_down: 0.0,
-                                        });
-                                        info!("tcp drop {} {}", sock, err);
-                                    }
-                                }
-                                RoutingDecision::NoProxy(sock) => {
-                                    diag.emit(DiagEvent::Route {
-                                        id: conn_id,
-                                        ts: Timestamp::now(),
-                                        route: RoutingResovled::NoProxy(sock),
-                                    });
-                                    if let Err(err) = handle_tcp_nat(tcp, sock).await {
-                                        diag.emit(DiagEvent::Finished {
-                                            id: conn_id,
-                                            ts: Timestamp::now(),
-                                            error: Some(format!("{}", err)),
-                                            bytes_up: 0.0,
-                                            bytes_down: 0.0,
-                                        });
-                                        info!("tcp drop {} {}", sock, err);
+                                    match handle_tcp_nat(
+                                        tcp,
+                                        sock,
+                                        diag.clone(),
+                                        conn_id,
+                                        host_route_stats,
+                                    )
+                                    .await
+                                    {
+                                        Ok((bytes_up, bytes_down)) => {
+                                            diag.emit(DiagEvent::Finished {
+                                                id: conn_id,
+                                                ts: Timestamp::now(),
+                                                error: None,
+                                                bytes_up: bytes_up as f32,
+                                                bytes_down: bytes_down as f32,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            diag.emit(DiagEvent::Finished {
+                                                id: conn_id,
+                                                ts: Timestamp::now(),
+                                                error: Some(err.to_string()),
+                                                bytes_up: 0.0,
+                                                bytes_down: 0.0,
+                                            });
+                                            info!("tcp drop {} {}", sock, err);
+                                        }
                                     }
                                 }
                                 RoutingDecision::File(root) => {
@@ -427,10 +476,62 @@ pub async fn main_entry(
                     }
                 } else {
                     match resolv {
-                        VDNSRES::Opine(RoutingDecision::NATByTUN(host)) | VDNSRES::Opine(RoutingDecision::NoProxy(host)) => {
-                            info!("UDP protocol: NAT to {}. {:?}", &host, resolv);
+                        route @ VDNSRES::Opine(RoutingDecision::NATByTUN(host))
+                        | route @ VDNSRES::Opine(RoutingDecision::NoProxy(host)) => {
+                            info!("UDP protocol: NAT to {}", &host);
+                            let route = match route {
+                                VDNSRES::Opine(RoutingDecision::NATByTUN(_)) => {
+                                    RoutingResovled::NATByTUN(host)
+                                }
+                                VDNSRES::Opine(RoutingDecision::NoProxy(_)) => {
+                                    RoutingResovled::NoProxy(host)
+                                }
+                                _ => unreachable!(),
+                            };
+                            diag.emit(DiagEvent::Route {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                route,
+                            });
+                            record_host_route_observed(
+                                &host_route_stats,
+                                &diag,
+                                WireAddress::SocketAddress(host),
+                                ObservedRoute::NoProxy,
+                            )
+                            .await;
+                            let host_route_stats = host_route_stats.clone();
+                            let diag = diag.clone();
                             tokio::spawn(async move {
-                                handle_udp_nat(udp, host).await?;
+                                match handle_udp_nat(
+                                    udp,
+                                    host,
+                                    diag.clone(),
+                                    conn_id,
+                                    host_route_stats,
+                                )
+                                .await
+                                {
+                                    Ok((bytes_up, bytes_down)) => {
+                                        diag.emit(DiagEvent::Finished {
+                                            id: conn_id,
+                                            ts: Timestamp::now(),
+                                            error: None,
+                                            bytes_up: bytes_up as f32,
+                                            bytes_down: bytes_down as f32,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        diag.emit(DiagEvent::Finished {
+                                            id: conn_id,
+                                            ts: Timestamp::now(),
+                                            error: Some(err.to_string()),
+                                            bytes_up: 0.0,
+                                            bytes_down: 0.0,
+                                        });
+                                        error!("UDP NAT to {} failed: {}", host, err);
+                                    }
+                                }
                                 aok!(())
                             });
                         }
@@ -451,13 +552,328 @@ pub async fn main_entry(
     Ok(())
 }
 
-async fn handle_tcp_nat(mut tcp_stack: IpStackTcpStream, server_addr: SocketAddr) -> crate::Result<()> {
+async fn handle_tcp_nat(
+    mut tcp_stack: IpStackTcpStream,
+    server_addr: SocketAddr,
+    diag: DiagServer,
+    conn_id: ConnId,
+    host_route_stats: HostRouteStatsMap,
+) -> crate::Result<(u64, u64)> {
     info!("NAT {} (app) connect {} (remote)", tcp_stack.local_addr(), &server_addr);
-    let mut server = TcpStream::connect(server_addr).await?;
+    let connect_start = Instant::now();
+    let mut server = match TcpStream::connect(server_addr).await {
+        Ok(server) => server,
+        Err(error) => {
+            record_no_proxy_attempt(
+                &host_route_stats,
+                &diag,
+                WireAddress::SocketAddress(server_addr),
+                connect_start.elapsed(),
+                false,
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
+    let connect_latency = connect_start.elapsed();
+    diag.emit(DiagEvent::Connected {
+        id: conn_id,
+        ts: Timestamp::now(),
+    });
 
-    tokio::io::copy_bidirectional(&mut tcp_stack, &mut server).await?;
+    match copy_bidirectional_with_stats(
+        &mut tcp_stack,
+        &mut server,
+        host_route_stats.clone(),
+        diag.clone(),
+        WireAddress::SocketAddress(server_addr),
+        false,
+    )
+    .await
+    {
+        Ok((bytes_up, bytes_down, upload_sample, download_sample)) => {
+            update_no_proxy_stats(
+                &host_route_stats,
+                &diag,
+                WireAddress::SocketAddress(server_addr),
+                |stats, at| {
+                    stats.record_tcp_connection(
+                        connect_latency,
+                        upload_sample,
+                        download_sample,
+                        at,
+                    );
+                },
+            )
+            .await;
+            Ok((bytes_up, bytes_down))
+        }
+        Err(error) => {
+            record_no_proxy_attempt(
+                &host_route_stats,
+                &diag,
+                WireAddress::SocketAddress(server_addr),
+                connect_latency,
+                false,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
 
-    Ok(())
+async fn handle_udp_nat(
+    mut udp_stack: IpStackUdpStream,
+    server_addr: SocketAddr,
+    diag: DiagServer,
+    conn_id: ConnId,
+    host_route_stats: HostRouteStatsMap,
+) -> crate::Result<(u64, u64)> {
+    let mut udp_server = UdpStream::connect(server_addr).await?;
+    debug!("UDP connected to {}", server_addr);
+    diag.emit(DiagEvent::Connected {
+        id: conn_id,
+        ts: Timestamp::now(),
+    });
+    let (bytes_up, bytes_down, _, _) = copy_bidirectional_with_stats(
+        &mut udp_stack,
+        &mut udp_server,
+        host_route_stats,
+        diag,
+        WireAddress::SocketAddress(server_addr),
+        true,
+    )
+    .await?;
+    Ok((bytes_up, bytes_down))
+}
+
+async fn update_no_proxy_stats(
+    host_route_stats: &HostRouteStatsMap,
+    diag: &DiagServer,
+    target: WireAddress,
+    update: impl FnOnce(&mut HostRouteStats, Timestamp),
+) {
+    let key = HostRouteKey::new(target, ObservedRoute::NoProxy);
+    let observed_at = Timestamp::now();
+    let metric = {
+        let mut stats = host_route_stats.lock().await;
+        let entry = host_route_stats_mut(&mut stats, key.clone());
+        update(entry, observed_at);
+        entry.metric(key, observed_at)
+    };
+    diag.emit(DiagEvent::HostRouteStatsUpdated {
+        ts: metric.observed_at,
+        stat: metric,
+    });
+}
+
+fn host_route_stats_mut(
+    stats: &mut HashMap<HostRouteKey, HostRouteStats>,
+    key: HostRouteKey,
+) -> &mut HostRouteStats {
+    if !stats.contains_key(&key) && stats.len() >= MAX_HOST_ROUTE_STATS {
+        if let Some(oldest) = stats
+            .iter()
+            .min_by_key(|(_, stats)| stats.last_observed)
+            .map(|(key, _)| key.clone())
+        {
+            stats.remove(&oldest);
+        }
+    }
+    stats.entry(key).or_default()
+}
+
+async fn record_no_proxy_attempt(
+    host_route_stats: &HostRouteStatsMap,
+    diag: &DiagServer,
+    target: WireAddress,
+    connect_latency: Duration,
+    success: bool,
+) {
+    update_no_proxy_stats(host_route_stats, diag, target, |stats, at| {
+        stats.record_tcp_attempt(connect_latency, success, at);
+    })
+    .await;
+}
+
+async fn record_host_route_observed(
+    host_route_stats: &HostRouteStatsMap,
+    diag: &DiagServer,
+    target: WireAddress,
+    route: ObservedRoute,
+) {
+    let key = HostRouteKey::new(target, route);
+    let observed_at = Timestamp::now();
+    let metric = {
+        let mut stats = host_route_stats.lock().await;
+        let entry = host_route_stats_mut(&mut stats, key.clone());
+        entry.last_observed = Some(observed_at);
+        entry.metric(key, observed_at)
+    };
+    diag.emit(DiagEvent::HostRouteStatsUpdated {
+        ts: metric.observed_at,
+        stat: metric,
+    });
+}
+
+async fn record_no_proxy_transfer_samples(
+    host_route_stats: &HostRouteStatsMap,
+    diag: &DiagServer,
+    target: WireAddress,
+    upload_sample: Option<TransferRateSample>,
+    download_sample: Option<TransferRateSample>,
+    udp: bool,
+) {
+    if upload_sample.is_none() && download_sample.is_none() {
+        return;
+    }
+
+    update_no_proxy_stats(host_route_stats, diag, target, |stats, at| {
+        if udp {
+            stats.record_udp_transfer_samples(upload_sample, download_sample, at);
+        } else {
+            stats.record_tcp_transfer_samples(upload_sample, download_sample, at);
+        }
+    })
+    .await;
+}
+
+async fn copy_bidirectional_with_stats<A, B>(
+    left: &mut A,
+    right: &mut B,
+    host_route_stats: HostRouteStatsMap,
+    diag: DiagServer,
+    stats_target: WireAddress,
+    udp: bool,
+) -> crate::Result<(
+    u64,
+    u64,
+    Option<TransferRateSample>,
+    Option<TransferRateSample>,
+)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let (mut left_read, mut left_write) = tokio::io::split(left);
+    let (mut right_read, mut right_write) = tokio::io::split(right);
+    let transfer_start = Instant::now();
+
+    let upload = copy_direction_with_stats(
+        &mut left_read,
+        &mut right_write,
+        transfer_start,
+        host_route_stats.clone(),
+        diag.clone(),
+        stats_target.clone(),
+        udp,
+        true,
+    );
+    let download = copy_direction_with_stats(
+        &mut right_read,
+        &mut left_write,
+        transfer_start,
+        host_route_stats,
+        diag,
+        stats_target,
+        udp,
+        false,
+    );
+    let ((bytes_up, upload_sample), (bytes_down, download_sample)) =
+        tokio::try_join!(upload, download)?;
+    Ok((
+        bytes_up,
+        bytes_down,
+        upload_sample,
+        download_sample,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn copy_direction_with_stats<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    transfer_start: Instant,
+    host_route_stats: HostRouteStatsMap,
+    diag: DiagServer,
+    stats_target: WireAddress,
+    udp: bool,
+    upload: bool,
+) -> crate::Result<(u64, Option<TransferRateSample>)>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut buffer = [0u8; 8192];
+    let mut bytes_copied = 0u64;
+    let mut rate_tracker = TransferRateTracker::default();
+    let mut last_rate_update = Duration::ZERO;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let mut written = 0;
+        while written < read {
+            let count = writer.write(&buffer[written..read]).await?;
+            if count == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            written += count;
+            bytes_copied = bytes_copied.saturating_add(count as u64);
+            let elapsed = transfer_start.elapsed();
+            rate_tracker.record(count as u128, elapsed);
+
+            if elapsed.saturating_sub(last_rate_update) >= Duration::from_secs(1) {
+                if let Some(sample) = rate_tracker.sample(Timestamp::now()) {
+                    let (upload_sample, download_sample) = if upload {
+                        (Some(sample), None)
+                    } else {
+                        (None, Some(sample))
+                    };
+                    record_no_proxy_transfer_samples(
+                        &host_route_stats,
+                        &diag,
+                        stats_target.clone(),
+                        upload_sample,
+                        download_sample,
+                        udp,
+                    )
+                    .await;
+                    last_rate_update = elapsed;
+                }
+            }
+        }
+    }
+
+    if let Err(error) = writer.shutdown().await {
+        if error.kind() != std::io::ErrorKind::BrokenPipe
+            && error.kind() != std::io::ErrorKind::ConnectionReset
+        {
+            return Err(error.into());
+        }
+    }
+    let sample = rate_tracker.sample(Timestamp::now());
+    if let Some(sample) = sample {
+        let (upload_sample, download_sample) = if upload {
+            (Some(sample), None)
+        } else {
+            (None, Some(sample))
+        };
+        record_no_proxy_transfer_samples(
+            &host_route_stats,
+            &diag,
+            stats_target,
+            upload_sample,
+            download_sample,
+            udp,
+        )
+        .await;
+    }
+
+    Ok((bytes_copied, sample))
 }
 
 async fn handle_tcp_session(
@@ -606,14 +1022,6 @@ async fn handle_udp_associate_session(
     Ok(())
 }
 
-async fn handle_udp_nat(mut udp_stack: IpStackUdpStream, server_addr: SocketAddr) -> crate::Result<()> {
-    let mut udp_server = UdpStream::connect(server_addr).await?;
-    debug!("UDP connected to {}", server_addr);
-    copy_bidirectional(&mut udp_server, &mut udp_stack).await?;
-
-    Ok(())
-}
-
 async fn handle_dns_over_tcp_session(
     mut udp_stack: IpStackUdpStream,
     server_addr: SocketAddr,
@@ -738,4 +1146,114 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
         }
     }
     Ok(proxy_handler.get_udp_associate())
+}
+
+#[cfg(test)]
+mod no_proxy_stats_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn no_proxy_metrics_include_tcp_and_udp_statistics() {
+        let host_route_stats = Arc::new(Mutex::new(HashMap::new()));
+        let diag = DiagServer::noop();
+        let target = WireAddress::SocketAddress("192.0.2.10:443".parse().unwrap());
+        let observed_at = Timestamp::now();
+        let upload = TransferRateSample {
+            bytes: 1_000,
+            duration_micros: 1_000_000,
+            event_count: 3,
+            observed_at,
+        };
+        let download = TransferRateSample {
+            bytes: 2_000,
+            duration_micros: 1_000_000,
+            event_count: 3,
+            observed_at,
+        };
+
+        record_no_proxy_attempt(
+            &host_route_stats,
+            &diag,
+            target.clone(),
+            Duration::from_millis(50),
+            true,
+        )
+        .await;
+        record_no_proxy_transfer_samples(
+            &host_route_stats,
+            &diag,
+            target.clone(),
+            Some(upload),
+            Some(download),
+            false,
+        )
+        .await;
+        record_no_proxy_transfer_samples(
+            &host_route_stats,
+            &diag,
+            target.clone(),
+            Some(upload),
+            Some(download),
+            true,
+        )
+        .await;
+
+        let key = HostRouteKey::new(target, ObservedRoute::NoProxy);
+        let stats = host_route_stats.lock().await;
+        let metric = stats
+            .get(&key)
+            .unwrap()
+            .metric(key, Timestamp::now());
+
+        assert_eq!(metric.connect_latency_ms, Some(50.0));
+        assert_eq!(metric.connect_success_rate, Some(1.0));
+        assert_eq!(metric.upload_bytes_per_sec, Some(1_000.0));
+        assert_eq!(metric.download_bytes_per_sec, Some(2_000.0));
+        assert_eq!(metric.udp_upload_bytes_per_sec, Some(1_000.0));
+        assert_eq!(metric.udp_download_bytes_per_sec, Some(2_000.0));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_tcp_copy_records_rate_from_forwarded_writes() {
+        let host_route_stats: HostRouteStatsMap = Arc::new(Mutex::new(HashMap::new()));
+        let diag = DiagServer::noop();
+        let target = WireAddress::SocketAddress("192.0.2.10:443".parse().unwrap());
+        let (mut source, mut source_reader) = tokio::io::duplex(4096);
+        let (mut destination_writer, mut destination) = tokio::io::duplex(4096);
+
+        let copy = copy_direction_with_stats(
+            &mut source_reader,
+            &mut destination_writer,
+            Instant::now(),
+            host_route_stats.clone(),
+            diag.clone(),
+            target.clone(),
+            false,
+            true,
+        );
+        let send = async {
+            for byte in 0..4u8 {
+                source.write_all(&[byte; 128]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+            source.shutdown().await.unwrap();
+        };
+        let (copied, ()) = tokio::join!(copy, send);
+        let (copied, sample) = copied.unwrap();
+        assert_eq!(copied, 512);
+        assert!(sample.is_some_and(|sample| sample.event_count >= 3));
+
+        let mut received = Vec::new();
+        destination.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received.len(), 512);
+
+        let key = HostRouteKey::new(target, ObservedRoute::NoProxy);
+        let stats = host_route_stats.lock().await;
+        let metric = stats
+            .get(&key)
+            .unwrap()
+            .metric(key, Timestamp::now());
+        assert!(metric.upload_bytes_per_sec.is_some());
+        assert!(metric.upload_sample.is_some());
+    }
 }
