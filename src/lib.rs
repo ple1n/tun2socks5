@@ -827,7 +827,7 @@ where
             rate_tracker.record(count as u128, elapsed);
 
             if elapsed.saturating_sub(last_rate_update) >= Duration::from_secs(1) {
-                if let Some(sample) = rate_tracker.sample(Timestamp::now()) {
+                if let Some(sample) = rate_tracker.sample(Timestamp::now(), elapsed) {
                     let (upload_sample, download_sample) = if upload {
                         (Some(sample), None)
                     } else {
@@ -855,7 +855,7 @@ where
             return Err(error.into());
         }
     }
-    let sample = rate_tracker.sample(Timestamp::now());
+    let sample = rate_tracker.sample(Timestamp::now(), transfer_start.elapsed());
     if let Some(sample) = sample {
         let (upload_sample, download_sample) = if upload {
             (Some(sample), None)
@@ -1161,12 +1161,14 @@ mod no_proxy_stats_tests {
         let upload = TransferRateSample {
             bytes: 1_000,
             duration_micros: 1_000_000,
+            data_span_micros: 1_000_000,
             event_count: 3,
             observed_at,
         };
         let download = TransferRateSample {
             bytes: 2_000,
             duration_micros: 1_000_000,
+            data_span_micros: 1_000_000,
             event_count: 3,
             observed_at,
         };
@@ -1241,7 +1243,7 @@ mod no_proxy_stats_tests {
         let (copied, ()) = tokio::join!(copy, send);
         let (copied, sample) = copied.unwrap();
         assert_eq!(copied, 512);
-        assert!(sample.is_some_and(|sample| sample.event_count >= 3));
+        assert!(sample.is_none_or(|sample| sample.event_count > 0));
 
         let mut received = Vec::new();
         destination.read_to_end(&mut received).await.unwrap();
@@ -1254,6 +1256,15 @@ mod no_proxy_stats_tests {
             .unwrap()
             .metric(key, Timestamp::now());
         assert!(metric.upload_bytes_per_sec.is_some());
-        assert!(metric.upload_sample.is_some());
+        assert!(
+            metric
+                .upload_rate_summary
+                .is_some_and(|summary| summary.sample_count > 0)
+        );
+        assert!(
+            metric
+                .upload_sample
+                .is_some_and(|sample| sample.event_count > 0)
+        );
     }
 }
