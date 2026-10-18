@@ -5,7 +5,7 @@ use crate::{
     session_info::SessionInfo,
 };
 use anyhow::bail;
-use socks5_impl::protocol::{self, handshake, password_method, WireAddress, AuthMethod, StreamOperation, UserKey, Version};
+use socks5_impl::protocol::{self, handshake, password_method, AuthMethod, StreamOperation, UserKey, Version, WireAddress};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::*;
@@ -33,6 +33,7 @@ struct SocksProxyImpl {
     credentials: Option<UserKey>,
     command: protocol::Command,
     udp_associate: Option<SocketAddr>,
+    raw_udp_associate: Option<WireAddress>,
 }
 
 impl SocksProxyImpl {
@@ -48,6 +49,7 @@ impl SocksProxyImpl {
             credentials,
             command,
             udp_associate: None,
+            raw_udp_associate: None,
         };
         result.send_client_hello()?;
         Ok(result)
@@ -68,7 +70,7 @@ impl SocksProxyImpl {
                     bail!("SOCKS4 does not support IPv6")
                 }
             },
-            _ => todo!()
+            _ => todo!(),
         }
         self.server_outbuf.extend(ip_vec);
         if let Some(credentials) = credentials {
@@ -212,7 +214,8 @@ impl SocksProxyImpl {
             bail!(format!("SOCKS protocol: {}", response.reply))
         }
         if self.command == protocol::Command::UdpAssociate {
-            self.udp_associate = Some(SocketAddr::try_from(&response.address)?);
+            self.raw_udp_associate = Some(response.address.clone());
+            self.udp_associate = SocketAddr::try_from(&response.address).ok();
             // trace!("UDP associate recieved address {}", response.address);
         }
 
@@ -304,6 +307,10 @@ impl ProxyHandler for SocksProxyImpl {
 
     fn get_udp_associate(&self) -> Option<SocketAddr> {
         self.udp_associate
+    }
+
+    fn get_raw_udp_associate(&self) -> Option<WireAddress> {
+        self.raw_udp_associate.clone()
     }
 }
 

@@ -404,11 +404,7 @@ impl VirtDNSHandle {
 
         // Insert both mappings before eviction to ensure atomicity
         self.f_domain.insert(dom.clone(), DomainEntry::Pool(own.clone()));
-        diag::history::record_mapping_start(
-            IpAddr::V4(addr),
-            &dom,
-            diag::Timestamp::now(),
-        );
+        diag::history::record_mapping_start(IpAddr::V4(addr), &dom, diag::Timestamp::now());
         self.f_ip.insert(
             ip_key,
             IPKeyEntry {
@@ -475,11 +471,7 @@ impl VirtDNSHandle {
         let v4a = self.ipv4a(ip);
 
         self.f_domain.insert(dom.clone(), DomainEntry::BitSet(v4a));
-        diag::history::record_mapping_start(
-            IpAddr::V4(ip),
-            &dom,
-            diag::Timestamp::now(),
-        );
+        diag::history::record_mapping_start(IpAddr::V4(ip), &dom, diag::Timestamp::now());
         self.f_ip.insert(
             v4a,
             IPKeyEntry {
@@ -503,14 +495,9 @@ impl VirtDNSHandle {
             let ipa = self.ipv6a(ip);
             if self.ip6.get(&ipa).is_none() {
                 self.ip6.insert(ipa, RoutingDecision::HostOverProxy(qname.clone()));
-                diag::history::record_mapping_start(
-                    IpAddr::V6(ip),
-                    &qname,
-                    diag::Timestamp::now(),
-                );
+                diag::history::record_mapping_start(IpAddr::V6(ip), &qname, diag::Timestamp::now());
             }
-            let message =
-                build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
+            let message = build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
             Ok(message.to_vec()?)
         } else {
             match qtype {
@@ -524,14 +511,12 @@ impl VirtDNSHandle {
                         Some(ip) => ip,
                         None => self.respond_by_bitset(qname.clone())?,
                     };
-                    let message =
-                        build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
+                    let message = build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
                     Ok(message.to_vec()?)
                 }
                 _ => {
                     let ip = self.respond_by_bitset(qname.clone())?;
-                    let message =
-                        build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
+                    let message = build_dns_response(message, &qname, ip.into(), VIRTUAL_DNS_TTL_SECS)?;
                     Ok(message.to_vec()?)
                 }
             }
@@ -604,11 +589,7 @@ impl VirtDNSHandle {
                 },
             );
             self.f_domain.insert(dom.clone(), DomainEntry::Pinned(v4a));
-            diag::history::record_mapping_start(
-                IpAddr::V4(v4),
-                &dom,
-                diag::Timestamp::now(),
-            );
+            diag::history::record_mapping_start(IpAddr::V4(v4), &dom, diag::Timestamp::now());
         } else {
             let own = Arc::new(PoolEntryT {
                 lock: self.alloc_v4.pool.clone().get_rc(),
@@ -623,11 +604,7 @@ impl VirtDNSHandle {
                     lifetime: own.clone().into(),
                 },
             );
-            diag::history::record_mapping_start(
-                IpAddr::V4(addr),
-                &dom,
-                diag::Timestamp::now(),
-            );
+            diag::history::record_mapping_start(IpAddr::V4(addr), &dom, diag::Timestamp::now());
             self.f_domain.insert(dom, DomainEntry::Pool(own));
         };
 
@@ -637,11 +614,7 @@ impl VirtDNSHandle {
         self.apply_evictions();
         if let Some((_domain, entry)) = self.f_domain.remove(&dom) {
             let addr = entry.addr_a();
-            diag::history::record_mapping_end(
-                IpAddr::V4(addr.addr),
-                &dom,
-                diag::Timestamp::now(),
-            );
+            diag::history::record_mapping_end(IpAddr::V4(addr.addr), &dom, diag::Timestamp::now());
             self.f_ip.remove(&addr);
             if let DomainEntry::BitSet(v4a) = entry {
                 self.dealloc_bitset(v4a.addr);
@@ -657,20 +630,11 @@ fn virtual_dns_answers_have_a_cacheable_ttl() {
     let virt = VirtDNSAsync::default(POOL_SIZE).unwrap();
     for record_type in [RecordType::A, RecordType::AAAA] {
         let mut query = Message::new();
-        query.add_query(Query::query(
-            Name::from_str("dnf.example.").unwrap(),
-            record_type,
-        ));
-        let response = virt
-            .handle
-            .receive_query(&query.to_vec().unwrap())
-            .unwrap();
+        query.add_query(Query::query(Name::from_str("dnf.example.").unwrap(), record_type));
+        let response = virt.handle.receive_query(&query.to_vec().unwrap()).unwrap();
         let response = parse_data_to_dns_message(&response, false).unwrap();
 
         assert_eq!(response.answers().len(), 1);
-        assert_eq!(
-            response.answers().first().unwrap().ttl(),
-            VIRTUAL_DNS_TTL_SECS
-        );
+        assert_eq!(response.answers().first().unwrap().ttl(), VIRTUAL_DNS_TTL_SECS);
     }
 }

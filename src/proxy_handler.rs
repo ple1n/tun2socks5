@@ -18,6 +18,9 @@ pub(crate) trait ProxyHandler: Send + Sync + Debug {
     fn data_len(&self, dir: OutgoingDirection) -> usize;
     fn reset_connection(&self) -> bool;
     fn get_udp_associate(&self) -> Option<SocketAddr>;
+    fn get_raw_udp_associate(&self) -> Option<socks5_impl::protocol::WireAddress> {
+        self.get_udp_associate().map(socks5_impl::protocol::WireAddress::SocketAddress)
+    }
 }
 
 #[async_trait::async_trait]
