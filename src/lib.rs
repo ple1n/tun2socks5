@@ -31,7 +31,7 @@ use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
 use socks5_impl::protocol::{UserKey, WireAddress};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt::Debug,
     future::Future,
     io::Write,
@@ -77,7 +77,46 @@ pub use tun_rs;
 const DNS_PORT: u16 = 53;
 const MAX_HOST_ROUTE_STATS: usize = 16_384;
 
-type HostRouteStatsMap = Arc<Mutex<HashMap<HostRouteKey, HostRouteStats>>>;
+type HostRouteStatsMap = Arc<Mutex<HostRouteStatsCache>>;
+
+struct HostRouteStatsCache {
+    entries: HashMap<HostRouteKey, HostRouteStats>,
+    eviction_order: BTreeSet<(Timestamp, HostRouteKey)>,
+    capacity: usize,
+}
+
+impl HostRouteStatsCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            eviction_order: BTreeSet::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn get(&self, key: &HostRouteKey) -> Option<&HostRouteStats> {
+        self.entries.get(key)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&HostRouteKey, &HostRouteStats)> {
+        self.entries.iter()
+    }
+
+    fn update<R>(&mut self, key: HostRouteKey, update: impl FnOnce(&mut HostRouteStats) -> R) -> R {
+        if let Some(stats) = self.entries.get(&key) {
+            self.eviction_order.remove(&(stats.last_observed.unwrap_or_default(), key.clone()));
+        } else if self.entries.len() >= self.capacity {
+            if let Some((_, oldest)) = self.eviction_order.pop_first() {
+                self.entries.remove(&oldest);
+            }
+        }
+
+        let stats = self.entries.entry(key.clone()).or_default();
+        let result = update(stats);
+        self.eviction_order.insert((stats.last_observed.unwrap_or_default(), key));
+        result
+    }
+}
 
 static TASK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::atomic::Ordering::Relaxed;
@@ -128,7 +167,7 @@ pub async fn main_entry(
     } else {
         (DiagServer::noop(), None)
     };
-    let host_route_stats: HostRouteStatsMap = Arc::new(Mutex::new(HashMap::new()));
+    let host_route_stats: HostRouteStatsMap = Arc::new(Mutex::new(HostRouteStatsCache::new(MAX_HOST_ROUTE_STATS)));
     if let Some(mut commands) = diag_commands {
         let diag = diag.clone();
         let host_route_stats = host_route_stats.clone();
@@ -639,27 +678,15 @@ async fn update_no_proxy_stats(
     let observed_at = Timestamp::now();
     let metric = {
         let mut stats = host_route_stats.lock().await;
-        let entry = host_route_stats_mut(&mut stats, key.clone());
-        update(entry, observed_at);
-        entry.metric(key, observed_at)
+        stats.update(key.clone(), |entry| {
+            update(entry, observed_at);
+            entry.metric(key, observed_at)
+        })
     };
     diag.emit(DiagEvent::HostRouteStatsUpdated {
         ts: metric.observed_at,
         stat: metric,
     });
-}
-
-fn host_route_stats_mut(stats: &mut HashMap<HostRouteKey, HostRouteStats>, key: HostRouteKey) -> &mut HostRouteStats {
-    if !stats.contains_key(&key) && stats.len() >= MAX_HOST_ROUTE_STATS {
-        if let Some(oldest) = stats
-            .iter()
-            .min_by_key(|(_, stats)| stats.last_observed)
-            .map(|(key, _)| key.clone())
-        {
-            stats.remove(&oldest);
-        }
-    }
-    stats.entry(key).or_default()
 }
 
 async fn record_no_proxy_attempt(
@@ -680,9 +707,10 @@ async fn record_host_route_observed(host_route_stats: &HostRouteStatsMap, diag: 
     let observed_at = Timestamp::now();
     let metric = {
         let mut stats = host_route_stats.lock().await;
-        let entry = host_route_stats_mut(&mut stats, key.clone());
-        entry.last_observed = Some(observed_at);
-        entry.metric(key, observed_at)
+        stats.update(key.clone(), |entry| {
+            entry.last_observed = Some(observed_at);
+            entry.metric(key, observed_at)
+        })
     };
     diag.emit(DiagEvent::HostRouteStatsUpdated {
         ts: metric.observed_at,
@@ -1312,9 +1340,34 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
 mod no_proxy_stats_tests {
     use super::*;
 
+    #[test]
+    fn host_route_stats_cache_evicts_oldest_without_scanning_entries() {
+        let key = |address: &str| HostRouteKey::new(WireAddress::SocketAddress(address.parse().unwrap()), ObservedRoute::NoProxy);
+        let (first, second, third) = (key("192.0.2.1:443"), key("192.0.2.2:443"), key("192.0.2.3:443"));
+        let mut cache = HostRouteStatsCache::new(2);
+
+        cache.update(first.clone(), |stats| {
+            stats.last_observed = Some(Timestamp(10));
+        });
+        cache.update(second.clone(), |stats| {
+            stats.last_observed = Some(Timestamp(20));
+        });
+        cache.update(first.clone(), |stats| {
+            stats.last_observed = Some(Timestamp(30));
+        });
+        cache.update(third.clone(), |stats| {
+            stats.last_observed = Some(Timestamp(40));
+        });
+
+        assert!(cache.get(&first).is_some());
+        assert!(cache.get(&second).is_none());
+        assert!(cache.get(&third).is_some());
+        assert_eq!(cache.eviction_order.len(), 2);
+    }
+
     #[tokio::test]
     async fn no_proxy_metrics_include_tcp_and_udp_statistics() {
-        let host_route_stats = Arc::new(Mutex::new(HashMap::new()));
+        let host_route_stats = Arc::new(Mutex::new(HostRouteStatsCache::new(MAX_HOST_ROUTE_STATS)));
         let diag = DiagServer::noop();
         let target = WireAddress::SocketAddress("192.0.2.10:443".parse().unwrap());
         let observed_at = Timestamp::now();
@@ -1351,7 +1404,7 @@ mod no_proxy_stats_tests {
 
     #[tokio::test]
     async fn no_proxy_tcp_copy_records_rate_from_forwarded_writes() {
-        let host_route_stats: HostRouteStatsMap = Arc::new(Mutex::new(HashMap::new()));
+        let host_route_stats: HostRouteStatsMap = Arc::new(Mutex::new(HostRouteStatsCache::new(MAX_HOST_ROUTE_STATS)));
         let diag = DiagServer::noop();
         let target = WireAddress::SocketAddress("192.0.2.10:443".parse().unwrap());
         let (mut source, mut source_reader) = tokio::io::duplex(4096);
