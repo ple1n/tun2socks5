@@ -938,7 +938,7 @@ async fn handle_udp_associate_session(
                 }
                 let buf2 = &buf2[..len];
 
-                let (source_addr, data) = parse_socks5_udp_datagram(buf2)?;
+                let (_source_addr, data) = parse_socks5_udp_datagram(buf2)?;
 
                 let buf = if session_info.dst.port() == DNS_PORT {
                     let mut message = dns::parse_data_to_dns_message(data, false)?;
@@ -950,7 +950,7 @@ async fn handle_udp_associate_session(
                     data.to_vec()
                 };
 
-                udp_stack.write_datagram_from(source_addr, &buf)?;
+                udp_stack.write_all(&buf).await?;
             }
         }
     }
@@ -976,7 +976,9 @@ async fn handle_shared_udp_session(
         WireAddress::DomainAddress(_, _) => udp_stack.peer_addr(),
     };
 
-    let mut inbound_rx = shared_udp.register_flow(conn_id, udp_stack.local_addr(), peer_addr).await;
+    let mut inbound_rx = shared_udp
+        .register_flow(conn_id, udp_stack.local_addr(), peer_addr, session_info.dst.clone())
+        .await;
 
     let mut buf = [0_u8; 4096];
     let mut bytes_up: f32 = 0.0;
@@ -1000,7 +1002,7 @@ async fn handle_shared_udp_session(
                     break;
                 }
             }
-            Some((remote_source, payload)) = inbound_rx.recv() => {
+            Some((_remote_source, payload)) = inbound_rx.recv() => {
                 bytes_down += payload.len() as f32;
                 let data = if session_info.dst.port() == DNS_PORT {
                     let mut message = dns::parse_data_to_dns_message(&payload, false)?;
@@ -1012,7 +1014,7 @@ async fn handle_shared_udp_session(
                     payload
                 };
 
-                if let Err(e) = udp_stack.write_datagram_from(remote_source, &data) {
+                if let Err(e) = udp_stack.write_all(&data).await {
                     session_err = Some(e.to_string());
                     break;
                 }
@@ -1032,17 +1034,16 @@ async fn handle_shared_udp_session(
     Ok(())
 }
 
-pub(crate) fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(SocketAddr, &[u8])> {
+pub(crate) fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(WireAddress, &[u8])> {
     use socks5_impl::protocol::{StreamOperation, UdpHeader};
 
     let header = UdpHeader::retrieve_from_stream(&mut &buf[..])?;
     if header.frag != 0 {
         bail!("fragmented SOCKS5 UDP datagrams are unsupported");
     }
-    let source_addr = SocketAddr::try_from(&header.address)?;
     let data = buf.get(header.len()..).ok_or_else(|| anyhow!("truncated SOCKS5 UDP datagram"))?;
 
-    Ok((source_addr, data))
+    Ok((header.address, data))
 }
 
 #[cfg(test)]
@@ -1057,6 +1058,19 @@ mod udp_associate_tests {
         UdpHeader::new(0, WireAddress::from(source_addr))
             .write_to_stream(&mut datagram)
             .unwrap();
+        datagram.extend_from_slice(b"payload");
+
+        let (parsed_source, payload) = parse_socks5_udp_datagram(&datagram).unwrap();
+
+        assert_eq!(parsed_source, WireAddress::from(source_addr));
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn parses_domain_udp_reply_source_address() {
+        let source_addr = WireAddress::DomainAddress("stun.l.google.com.".to_string(), 19302);
+        let mut datagram = Vec::new();
+        UdpHeader::new(0, source_addr.clone()).write_to_stream(&mut datagram).unwrap();
         datagram.extend_from_slice(b"payload");
 
         let (parsed_source, payload) = parse_socks5_udp_datagram(&datagram).unwrap();
@@ -1107,7 +1121,9 @@ mod udp_associate_tests {
         let peer_addr: SocketAddr = "23.234.105.208:54468".parse().unwrap();
         let conn_id = ConnId(42);
 
-        let mut rx = shared.register_flow(conn_id, local_addr, peer_addr).await;
+        let mut rx = shared
+            .register_flow(conn_id, local_addr, peer_addr, WireAddress::from(peer_addr))
+            .await;
 
         // Build a mock SOCKS5 datagram arriving from peer_addr
         let mut datagram = Vec::new();
@@ -1129,10 +1145,39 @@ mod udp_associate_tests {
             .expect("timeout waiting for demuxed datagram")
             .expect("channel closed");
 
-        assert_eq!(source, peer_addr);
+        assert_eq!(source, WireAddress::from(peer_addr));
         assert_eq!(payload, b"punch_ack_payload");
 
         // Deregister flow
+        shared.deregister_flow(conn_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_shared_udp_domain_reply_demux() {
+        let server_addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let shared = udp_associate::SharedUdpAssociate::new(server_addr, None, DiagServer::noop());
+        let local_addr: SocketAddr = "198.18.0.1:51257".parse().unwrap();
+        let peer_addr: SocketAddr = "100.68.0.1:45187".parse().unwrap();
+        let target = WireAddress::DomainAddress("stun.l.google.com".to_string(), 19302);
+        let conn_id = ConnId(43);
+
+        let mut rx = shared.register_flow(conn_id, local_addr, peer_addr, target).await;
+        let reply_source = WireAddress::DomainAddress("stun.l.google.com.".to_string(), 19302);
+        let mut datagram = Vec::new();
+        UdpHeader::new(0, reply_source.clone()).write_to_stream(&mut datagram).unwrap();
+        datagram.extend_from_slice(b"binding response");
+
+        let relay_endpoint: SocketAddr = "127.0.0.1:45240".parse().unwrap();
+        shared
+            .handle_incoming_relay_datagram(&datagram, relay_endpoint, relay_endpoint)
+            .await;
+
+        let (source, payload) = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timeout waiting for domain reply")
+            .expect("flow channel closed");
+        assert_eq!(source, reply_source);
+        assert_eq!(payload, b"binding response");
         shared.deregister_flow(conn_id).await;
     }
 }

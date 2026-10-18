@@ -2,13 +2,14 @@ use anyhow::{anyhow, bail};
 use diag::{ConnId, DiagEvent, DiagServer, SocksEndpointStatus, SocksOpKind, Timestamp};
 use socks5_impl::protocol::{StreamOperation, UdpHeader, UserKey, Version, WireAddress};
 use std::{
-    collections::HashMap,
-    net::SocketAddr,
+    collections::{HashMap, HashSet},
+    hash::Hash,
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -51,10 +52,78 @@ pub struct ActiveUdpRelay {
 
 #[derive(Clone)]
 struct FlowRegistration {
-    conn_id: ConnId,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-    inbound_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    target: WireAddress,
+    inbound_tx: mpsc::Sender<(WireAddress, Vec<u8>)>,
+}
+
+#[derive(Default)]
+struct FlowRegistry {
+    by_id: HashMap<ConnId, FlowRegistration>,
+    by_peer: HashMap<SocketAddr, HashSet<ConnId>>,
+    by_peer_ip: HashMap<IpAddr, HashSet<ConnId>>,
+    by_target: HashMap<WireAddress, HashSet<ConnId>>,
+}
+
+impl FlowRegistry {
+    fn register(&mut self, conn_id: ConnId, registration: FlowRegistration) {
+        self.deregister(conn_id);
+        insert_index(&mut self.by_peer, registration.peer_addr, conn_id);
+        insert_index(&mut self.by_peer_ip, registration.peer_addr.ip(), conn_id);
+        insert_index(&mut self.by_target, canonical_wire_address(&registration.target), conn_id);
+        self.by_id.insert(conn_id, registration);
+    }
+
+    fn deregister(&mut self, conn_id: ConnId) {
+        if let Some(registration) = self.by_id.remove(&conn_id) {
+            remove_index(&mut self.by_peer, &registration.peer_addr, conn_id);
+            remove_index(&mut self.by_peer_ip, &registration.peer_addr.ip(), conn_id);
+            remove_index(&mut self.by_target, &canonical_wire_address(&registration.target), conn_id);
+        }
+    }
+
+    fn match_flow(&self, remote_source: &WireAddress) -> Option<&FlowRegistration> {
+        let conn_id = match remote_source {
+            WireAddress::SocketAddress(addr) => lookup_index(&self.by_peer, addr)
+                .or_else(|| lookup_index(&self.by_target, remote_source))
+                .or_else(|| lookup_index(&self.by_peer_ip, &addr.ip())),
+            WireAddress::DomainAddress(..) => lookup_index(&self.by_target, &canonical_wire_address(remote_source)),
+        }
+        .or_else(|| {
+            if self.by_id.len() == 1 {
+                self.by_id.keys().next().copied()
+            } else {
+                None
+            }
+        })?;
+        self.by_id.get(&conn_id)
+    }
+}
+
+fn insert_index<K: Eq + Hash>(index: &mut HashMap<K, HashSet<ConnId>>, key: K, conn_id: ConnId) {
+    index.entry(key).or_default().insert(conn_id);
+}
+
+fn remove_index<K: Eq + Hash>(index: &mut HashMap<K, HashSet<ConnId>>, key: &K, conn_id: ConnId) {
+    if let Some(ids) = index.get_mut(key) {
+        ids.remove(&conn_id);
+        if ids.is_empty() {
+            index.remove(key);
+        }
+    }
+}
+
+fn lookup_index<K: Eq + Hash>(index: &HashMap<K, HashSet<ConnId>>, key: &K) -> Option<ConnId> {
+    let ids = index.get(key)?;
+    (ids.len() == 1).then(|| ids.iter().next().copied()).flatten()
+}
+
+fn canonical_wire_address(address: &WireAddress) -> WireAddress {
+    match address {
+        WireAddress::SocketAddress(addr) => WireAddress::SocketAddress(*addr),
+        WireAddress::DomainAddress(domain, port) => WireAddress::DomainAddress(domain.trim_end_matches('.').to_ascii_lowercase(), *port),
+    }
 }
 
 pub struct SharedUdpAssociate {
@@ -63,11 +132,19 @@ pub struct SharedUdpAssociate {
     diag: DiagServer,
     current_relay: Arc<RwLock<Option<Arc<ActiveUdpRelay>>>>,
     status: Arc<RwLock<SocksEndpointStatus>>,
-    flows: Arc<RwLock<HashMap<ConnId, FlowRegistration>>>,
+    flows: Arc<RwLock<FlowRegistry>>,
     pkts_tx: AtomicU64,
+    pkts_rx_datagrams: AtomicU64,
     pkts_rx: AtomicU64,
+    pkts_rx_source_rejected: AtomicU64,
+    pkts_rx_parse_errors: AtomicU64,
+    pkts_rx_unmatched: AtomicU64,
+    pkts_rx_delivery_dropped: AtomicU64,
+    pkts_rx_queued: AtomicU64,
     bytes_tx: AtomicU64,
     bytes_rx: AtomicU64,
+    stats_epoch: Instant,
+    last_stats_emit_ms: AtomicU64,
     active_flow_count: AtomicUsize,
     shutdown_tx: RwLock<Option<oneshot::Sender<()>>>,
 }
@@ -81,11 +158,19 @@ impl SharedUdpAssociate {
             diag,
             current_relay: Arc::new(RwLock::new(None)),
             status: Arc::new(RwLock::new(SocksEndpointStatus::Connecting)),
-            flows: Arc::new(RwLock::new(HashMap::new())),
+            flows: Arc::new(RwLock::new(FlowRegistry::default())),
             pkts_tx: AtomicU64::new(0),
+            pkts_rx_datagrams: AtomicU64::new(0),
             pkts_rx: AtomicU64::new(0),
+            pkts_rx_source_rejected: AtomicU64::new(0),
+            pkts_rx_parse_errors: AtomicU64::new(0),
+            pkts_rx_unmatched: AtomicU64::new(0),
+            pkts_rx_delivery_dropped: AtomicU64::new(0),
+            pkts_rx_queued: AtomicU64::new(0),
             bytes_tx: AtomicU64::new(0),
             bytes_rx: AtomicU64::new(0),
+            stats_epoch: Instant::now(),
+            last_stats_emit_ms: AtomicU64::new(0),
             active_flow_count: AtomicUsize::new(0),
             shutdown_tx: RwLock::new(Some(shutdown_tx)),
         });
@@ -134,11 +219,21 @@ impl SharedUdpAssociate {
     }
 
     pub fn emit_stats(&self) {
+        self.last_stats_emit_ms.store(
+            self.stats_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         let diag = self.diag.clone();
         let server_addr = self.server_addr;
         let active_flows = self.active_flow_count.load(Ordering::Relaxed);
         let pkts_tx = self.pkts_tx.load(Ordering::Relaxed);
+        let pkts_rx_datagrams = self.pkts_rx_datagrams.load(Ordering::Relaxed);
         let pkts_rx = self.pkts_rx.load(Ordering::Relaxed);
+        let pkts_rx_source_rejected = self.pkts_rx_source_rejected.load(Ordering::Relaxed);
+        let pkts_rx_parse_errors = self.pkts_rx_parse_errors.load(Ordering::Relaxed);
+        let pkts_rx_unmatched = self.pkts_rx_unmatched.load(Ordering::Relaxed);
+        let pkts_rx_delivery_dropped = self.pkts_rx_delivery_dropped.load(Ordering::Relaxed);
+        let pkts_rx_queued = self.pkts_rx_queued.load(Ordering::Relaxed);
         let bytes_tx = self.bytes_tx.load(Ordering::Relaxed);
         let bytes_rx = self.bytes_rx.load(Ordering::Relaxed);
 
@@ -148,10 +243,34 @@ impl SharedUdpAssociate {
             proxy_addr: server_addr,
             active_flows,
             pkts_tx,
+            pkts_rx_datagrams,
             pkts_rx,
+            pkts_rx_source_rejected,
+            pkts_rx_parse_errors,
+            pkts_rx_unmatched,
+            pkts_rx_delivery_dropped,
+            pkts_rx_queued,
             bytes_tx,
             bytes_rx,
         });
+    }
+
+    fn emit_stats_if_due(&self) {
+        let now_ms = self.stats_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        loop {
+            let last_ms = self.last_stats_emit_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_ms) < 1_000 {
+                return;
+            }
+            if self
+                .last_stats_emit_ms
+                .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.emit_stats();
+                return;
+            }
+        }
     }
 
     pub async fn register_flow(
@@ -159,19 +278,20 @@ impl SharedUdpAssociate {
         conn_id: ConnId,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-    ) -> mpsc::Receiver<(SocketAddr, Vec<u8>)> {
+        target: WireAddress,
+    ) -> mpsc::Receiver<(WireAddress, Vec<u8>)> {
         let (tx, rx) = mpsc::channel(256);
         let registration = FlowRegistration {
-            conn_id,
             local_addr,
             peer_addr,
+            target,
             inbound_tx: tx,
         };
 
         {
             let mut flows = self.flows.write().await;
-            flows.insert(conn_id, registration);
-            self.active_flow_count.store(flows.len(), Ordering::Relaxed);
+            flows.register(conn_id, registration);
+            self.active_flow_count.store(flows.by_id.len(), Ordering::Relaxed);
         }
 
         self.emit_stats();
@@ -181,8 +301,8 @@ impl SharedUdpAssociate {
     pub async fn deregister_flow(&self, conn_id: ConnId) {
         {
             let mut flows = self.flows.write().await;
-            flows.remove(&conn_id);
-            self.active_flow_count.store(flows.len(), Ordering::Relaxed);
+            flows.deregister(conn_id);
+            self.active_flow_count.store(flows.by_id.len(), Ordering::Relaxed);
         }
 
         self.emit_stats();
@@ -204,6 +324,7 @@ impl SharedUdpAssociate {
 
         self.pkts_tx.fetch_add(1, Ordering::Relaxed);
         self.bytes_tx.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.emit_stats_if_due();
 
         Ok(())
     }
@@ -391,8 +512,12 @@ impl SharedUdpAssociate {
     }
 
     pub(crate) async fn handle_incoming_relay_datagram(&self, buf: &[u8], from_addr: SocketAddr, effective_bnd: SocketAddr) {
+        self.pkts_rx_datagrams.fetch_add(1, Ordering::Relaxed);
+
         // Accept packets from relay
         if from_addr.ip() != effective_bnd.ip() && from_addr != effective_bnd {
+            self.pkts_rx_source_rejected.fetch_add(1, Ordering::Relaxed);
+            self.emit_stats_if_due();
             trace!(
                 "ignoring UDP datagram from unexpected source {} (expected relay {})",
                 from_addr,
@@ -404,6 +529,8 @@ impl SharedUdpAssociate {
         let (remote_source_addr, payload) = match parse_socks5_udp_datagram(buf) {
             Ok(res) => res,
             Err(e) => {
+                self.pkts_rx_parse_errors.fetch_add(1, Ordering::Relaxed);
+                self.emit_stats_if_due();
                 warn!("failed to parse incoming SOCKS5 UDP datagram: {}", e);
                 return;
             }
@@ -412,20 +539,79 @@ impl SharedUdpAssociate {
         self.pkts_rx.fetch_add(1, Ordering::Relaxed);
         self.bytes_rx.fetch_add(payload.len() as u64, Ordering::Relaxed);
 
-        let flows = self.flows.read().await;
-        // 1. Exact match on peer address
-        let matched = flows
-            .values()
-            .find(|f| f.peer_addr == remote_source_addr)
-            // 2. Fallback: match on peer IP
-            .or_else(|| flows.values().find(|f| f.peer_addr.ip() == remote_source_addr.ip()))
-            // 3. Fallback: single active flow in container
-            .or_else(|| if flows.len() == 1 { flows.values().next() } else { None });
+        let inbound_tx = {
+            let flows = self.flows.read().await;
+            flows.match_flow(&remote_source_addr).map(|flow| flow.inbound_tx.clone())
+        };
 
-        if let Some(flow) = matched {
-            let _ = flow.inbound_tx.try_send((remote_source_addr, payload.to_vec()));
+        if let Some(inbound_tx) = inbound_tx {
+            if inbound_tx.try_send((remote_source_addr, payload.to_vec())).is_ok() {
+                self.pkts_rx_queued.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.pkts_rx_delivery_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
+            self.pkts_rx_unmatched.fetch_add(1, Ordering::Relaxed);
             trace!("no active local flow registered for remote UDP source {}", remote_source_addr);
         }
+        self.emit_stats_if_due();
+    }
+}
+
+#[cfg(test)]
+mod flow_registry_tests {
+    use super::*;
+
+    #[test]
+    fn matches_domain_reply_and_removes_flow_indexes() {
+        let mut registry = FlowRegistry::default();
+        let conn_id = ConnId(7);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let peer_addr = "198.18.0.1:45187".parse().unwrap();
+        let target = WireAddress::DomainAddress("stun.l.google.com".to_string(), 19302);
+        registry.register(
+            conn_id,
+            FlowRegistration {
+                local_addr: "198.18.0.1:45187".parse().unwrap(),
+                peer_addr,
+                target,
+                inbound_tx,
+            },
+        );
+
+        let reply_source = WireAddress::DomainAddress("STUN.L.GOOGLE.COM.".to_string(), 19302);
+        assert_eq!(registry.match_flow(&reply_source).map(|flow| flow.local_addr), Some(peer_addr));
+
+        registry.deregister(conn_id);
+        assert!(registry.match_flow(&reply_source).is_none());
+        assert!(registry.by_peer.is_empty());
+        assert!(registry.by_peer_ip.is_empty());
+        assert!(registry.by_target.is_empty());
+    }
+
+    #[test]
+    fn does_not_route_ambiguous_domain_replies_to_an_arbitrary_flow() {
+        let mut registry = FlowRegistry::default();
+        let target = WireAddress::DomainAddress("stun.l.google.com".to_string(), 19302);
+        let peer_addr = "198.18.0.1:45187".parse().unwrap();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        for (conn_id, local_addr, inbound_tx) in [
+            (ConnId(1), "198.18.0.1:45187".parse().unwrap(), first_tx),
+            (ConnId(2), "198.18.0.1:45188".parse().unwrap(), second_tx),
+        ] {
+            registry.register(
+                conn_id,
+                FlowRegistration {
+                    local_addr,
+                    peer_addr,
+                    target: target.clone(),
+                    inbound_tx,
+                },
+            );
+        }
+
+        let reply_source = WireAddress::DomainAddress("stun.l.google.com".to_string(), 19302);
+        assert!(registry.match_flow(&reply_source).is_none());
     }
 }
